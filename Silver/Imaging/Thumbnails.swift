@@ -38,7 +38,7 @@ nonisolated enum Thumbnails {
                 kCIInputAspectRatioKey: 1,
             ])
         }
-        return context.createCGImage(output, from: output.extent.integral, format: .RGBA8, colorSpace: ImagePipeline.sRGB)
+        return ImagePipeline.bitmap(output, from: output.extent.integral, context: context)
     }
 }
 

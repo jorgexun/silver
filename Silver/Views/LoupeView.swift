@@ -101,7 +101,7 @@ private struct ZoomedCanvas: View {
     let base: CGImage?
 
     @State private var position = ScrollPosition()
-    @State private var visibleRect: CGRect = .zero
+    @State private var scroll = ScrollTracker()
     @State private var dragStart: CGPoint?
     @State private var didScrollToFocus = false
 
@@ -139,7 +139,7 @@ private struct ZoomedCanvas: View {
                         // translations would feed back into the scroll position.
                         DragGesture(minimumDistance: 3, coordinateSpace: .global)
                             .onChanged { value in
-                                let start = dragStart ?? visibleRect.origin
+                                let start = dragStart ?? scroll.origin
                                 dragStart = start
                                 position.scrollTo(point: CGPoint(x: start.x - value.translation.width, y: start.y - value.translation.height))
                             }
@@ -149,8 +149,8 @@ private struct ZoomedCanvas: View {
                 }
                 .scrollIndicators(.automatic)
                 .scrollPosition($position)
-                .onScrollGeometryChange(for: CGRect.self, of: { $0.visibleRect }) { _, rect in
-                    visibleRect = rect
+                .onScrollGeometryChange(for: CGRect.self, of: Self.visibleArea) { _, rect in
+                    scroll.origin = rect.origin
                     let visible = CGRect(
                         x: (rect.minX - inset.width) * displayScale,
                         y: (rect.minY - inset.height) * displayScale,
@@ -183,6 +183,23 @@ private struct ZoomedCanvas: View {
             }
         }
     }
+
+    /// The area not covered by the sidebar, inspector or toolbar, in content coordinates. Its
+    /// origin is the point `scrollTo(point:)` takes; `visibleRect` also covers the insets.
+    private static func visibleArea(_ geometry: ScrollGeometry) -> CGRect {
+        CGRect(
+            x: geometry.contentOffset.x + geometry.contentInsets.leading,
+            y: geometry.contentOffset.y + geometry.contentInsets.top,
+            width: geometry.containerSize.width,
+            height: geometry.containerSize.height
+        )
+    }
+}
+
+/// Scroll position read at the start of a drag. Not view state: it changes on every frame
+/// of a scroll, and nothing is drawn from it.
+private final class ScrollTracker {
+    var origin: CGPoint = .zero
 }
 
 private func fitRect(_ size: CGSize, in container: CGSize, padding: CGFloat) -> CGRect {

@@ -585,10 +585,16 @@ final class LibraryModel {
 
     // MARK: - Preview rendering
 
+    private var previewScreen: NSScreen? { NSScreen.main ?? NSScreen.screens.first }
+
     private var previewPixelSize: CGFloat {
-        let screen = NSScreen.main ?? NSScreen.screens.first
-        let size = screen.map { max($0.frame.width, $0.frame.height) * $0.backingScaleFactor } ?? 2560
+        let size = previewScreen.map { max($0.frame.width, $0.frame.height) * $0.backingScaleFactor } ?? 2560
         return min(max(size, 1600), 3600)
+    }
+
+    /// Previews are rendered in the screen's color space, so Core Animation can show them as is.
+    private var displayColorSpace: CGColorSpace {
+        previewScreen?.colorSpace?.cgColorSpace ?? ImagePipeline.sRGB
     }
 
     /// Renders the active photo. Requests made while a render is running are coalesced.
@@ -623,7 +629,7 @@ final class LibraryModel {
                     settings: settings,
                     geometry: geometry,
                     maxPixelSize: previewPixelSize,
-                    makeThumbnail: geometry
+                    colorSpace: displayColorSpace
                 )
 
                 guard let result else {
@@ -633,11 +639,12 @@ final class LibraryModel {
                     continue
                 }
                 photo.imageSize = result.baseSize
-                if let thumbnail = result.thumbnail, photo.settings == settings {
-                    photo.thumbnail = thumbnail
-                }
                 if photo.id == activeID {
                     preview = PreviewImage(photoID: photo.id, image: result.image, hasGeometry: geometry)
+                }
+                // Refresh the thumbnail once edits pause, not on every step of a slider drag.
+                if geometry, !renderPending, let thumbnail = await renderer.thumbnail(), photo.settings == settings {
+                    photo.thumbnail = thumbnail
                 }
             }
             renderTask = nil
@@ -682,8 +689,14 @@ final class LibraryModel {
             x: min(max(rect.midX / fullSize.width, 0), 1),
             y: min(max(rect.midY / fullSize.height, 0), 1)
         )
-        // Render a margin around the visible area so small pans don't reveal the soft base.
-        let margin = rect.insetBy(dx: -rect.width * 0.25, dy: -rect.height * 0.25)
+        // Render a margin around the visible area so small pans don't reveal the soft base, up to
+        // 256 px but within Core Image's cache budget (see "100% zoom" in CLAUDE.md).
+        let budget: CGFloat = 14_000_000
+        let sum = rect.width + rect.height
+        // Solves (width + 2 inset) × (height + 2 inset) = budget.
+        let fit = (-sum + (sum * sum - 4 * (rect.width * rect.height - budget)).squareRoot()) / 4
+        let inset = min(max(fit, 0), 256)
+        let margin = rect.insetBy(dx: -inset, dy: -inset)
         let viewport = margin.integral.intersection(CGRect(origin: .zero, size: fullSize))
         if let detail, detail.photoID == activeID, detail.rect.contains(rect), detailViewport != nil {
             detailViewport = viewport
@@ -706,7 +719,8 @@ final class LibraryModel {
                     url: photo.url,
                     settings: original ? EditSettings.default : photo.settings,
                     geometry: !original,
-                    rect: detailViewport
+                    rect: detailViewport,
+                    colorSpace: displayColorSpace
                 )
                 guard self.zoom?.photoID == photo.id, let result else { continue }
                 zoomFullSize = result.fullSize

@@ -5,8 +5,6 @@ nonisolated struct PreviewResult: @unchecked Sendable {
     let image: CGImage
     /// Size of the developed image before crop, used for crop geometry.
     let baseSize: CGSize
-    /// Small copy of a geometry-applied render, used to refresh the thumbnail.
-    let thumbnail: CGImage?
 }
 
 nonisolated struct DetailResult: @unchecked Sendable {
@@ -24,8 +22,10 @@ actor PreviewRenderer {
     private let context = CIContext(options: [.name: "Silver.Preview"])
     private var sources: [SourceImage] = []
     private let cacheLimit = 3
+    /// Last preview render with geometry applied, for `thumbnail()`.
+    private var lastRender: CIImage?
 
-    func render(url: URL, settings: EditSettings, geometry: Bool, maxPixelSize: CGFloat, makeThumbnail: Bool) -> PreviewResult? {
+    func render(url: URL, settings: EditSettings, geometry: Bool, maxPixelSize: CGFloat, colorSpace: CGColorSpace) -> PreviewResult? {
         guard let source = source(for: url, maxPixelSize: maxPixelSize) else { return nil }
         // A crop is enlarged to fill the screen, so decode enough pixels for the cropped area.
         // The crop tool shows the whole image; keep the current resolution there to avoid re-decoding.
@@ -33,20 +33,21 @@ actor PreviewRenderer {
             source.ensureLongEdge(source.longEdgeNeeded(for: settings.crop, outputPixelSize: maxPixelSize))
         }
         guard let (image, baseSize) = ImagePipeline.render(source, settings: settings, geometry: geometry),
-              let cgImage = context.createCGImage(image, from: image.extent, format: .RGBA8, colorSpace: ImagePipeline.sRGB)
+              let cgImage = ImagePipeline.bitmap(image, from: image.extent, context: context, colorSpace: colorSpace)
         else { return nil }
+        lastRender = geometry ? image : nil
+        return PreviewResult(image: cgImage, baseSize: baseSize)
+    }
 
-        var thumbnail: CGImage?
-        if makeThumbnail {
-            thumbnail = Thumbnails.downscale(image, maxPixelSize: Thumbnails.maxPixelSize, context: context)
-        }
-        return PreviewResult(image: cgImage, baseSize: baseSize, thumbnail: thumbnail)
+    /// Thumbnail of the last preview render, if it applied crop and straighten.
+    func thumbnail() -> CGImage? {
+        lastRender.flatMap { Thumbnails.downscale($0, maxPixelSize: Thumbnails.maxPixelSize, context: context) }
     }
 
     /// Renders part of the photo at full resolution, for viewing at 100%. `rect` is in
     /// full-resolution output pixels with a top-left origin and is clipped to the image; pass
     /// nil to only get the full-resolution size.
-    func renderDetail(url: URL, settings: EditSettings, geometry: Bool, rect: CGRect?) -> DetailResult? {
+    func renderDetail(url: URL, settings: EditSettings, geometry: Bool, rect: CGRect?, colorSpace: CGColorSpace) -> DetailResult? {
         guard let source = source(for: url, maxPixelSize: .infinity) else { return nil }
         source.ensureLongEdge(.infinity)
         guard let (image, _) = ImagePipeline.render(source, settings: settings, geometry: geometry) else { return nil }
@@ -58,7 +59,7 @@ actor PreviewRenderer {
         guard !clipped.isEmpty else { return nil }
         // Top-left origin → Core Image's bottom-left origin.
         let region = CGRect(x: extent.minX + clipped.minX, y: extent.maxY - clipped.maxY, width: clipped.width, height: clipped.height)
-        let cgImage = context.createCGImage(image, from: region, format: .RGBA8, colorSpace: ImagePipeline.sRGB)
+        let cgImage = ImagePipeline.bitmap(image, from: region, context: context, colorSpace: colorSpace)
         return DetailResult(image: cgImage, rect: clipped, fullSize: fullSize)
     }
 

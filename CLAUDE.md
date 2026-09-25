@@ -65,9 +65,16 @@ JPEG sources use `CITemperatureAndTint` for white balance and the same kernel wi
 `research.md` surveys how Adobe, Apple, darktable and RawTherapee design these curves, with measurements.
 
 **100% zoom.** Clicking the loupe image or pressing Z toggles `LibraryModel.zoom`. Switching photos while zoomed stays at 100% at the same relative position (`zoomCenter`), for comparing focus across a burst. The zoomed view is a `ScrollView` sized to the full-resolution output. The fit preview is stretched underneath as a placeholder, and on top `PreviewRenderer.renderDetail` renders only the visible area (plus a margin) at full resolution. While zoomed, edits re-render just that area; the fit preview is refreshed on exit. Rendering both sizes at once would flip the shared RAW decoder's scale back and forth.
+- The margin is up to 256 px, kept within a 14 MP region budget. Core Image keeps the decoded RAW cached only for regions up to about 16 MP. Past that, every edit decodes again: on a 5K window, about 150 ms per edit instead of about 10 ms.
+- The scroll view extends under the sidebar, inspector and toolbar as content insets. `scrollTo(point:)` takes the top-left of the visible area, which is `contentOffset` plus the leading and top insets, not `visibleRect.origin`.
+
+**Showing rendered images.** The preview and 100% detail go through `ImagePipeline.bitmap`, not `CIContext.createCGImage`:
+- `createCGImage` sometimes returns a lazily rendered image, which moves the render onto the main thread when the image is first drawn.
+- `bitmap` renders on the actor, in the screen's color space and in BGRA. Otherwise Core Animation converts every pixel on the CPU at commit while the main thread waits, about 40 ms for 14 MP.
 
 **Thumbnails and export.**
 - Thumbnails show the file's embedded preview first. Edited photos are re-rendered through the pipeline one at a time, because full RAW decodes don't parallelize and are memory heavy.
+- The active photo's thumbnail is refreshed from the preview render once edits pause (no newer render pending), not on every step of a slider drag.
 - Export runs jobs sequentially in `Task.detached`. It writes sRGB JPEGs with a whitelisted subset of the original EXIF/GPS/TIFF metadata and orientation 1.
 
 ## Decisions to preserve

@@ -204,6 +204,24 @@ nonisolated enum ImagePipeline {
         let image = geometry ? applyGeometry(settings, to: developed) : developed
         return (image, baseSize)
     }
+
+    /// Renders `rect` of `image` now, unlike `CIContext.createCGImage`, which may defer the
+    /// render until the image is drawn on the main thread. The layout is Core Animation's native
+    /// BGRA; pass the screen's color space for images shown on screen, so Core Animation doesn't
+    /// convert them on the CPU (see "Showing rendered images" in CLAUDE.md).
+    static func bitmap(_ image: CIImage, from rect: CGRect, context: CIContext, colorSpace: CGColorSpace = sRGB) -> CGImage? {
+        let width = Int(rect.width), height = Int(rect.height)
+        guard width > 0, height > 0 else { return nil }
+        let rowBytes = (width * 4 + 63) / 64 * 64
+        guard let data = NSMutableData(length: rowBytes * height) else { return nil }
+        context.render(image, toBitmap: data.mutableBytes, rowBytes: rowBytes, bounds: rect, format: .BGRA8, colorSpace: colorSpace)
+        guard let provider = CGDataProvider(data: data) else { return nil }
+        return CGImage(
+            width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: rowBytes, space: colorSpace,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue),
+            provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent
+        )
+    }
 }
 
 nonisolated enum PhotoFile {
