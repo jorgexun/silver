@@ -17,8 +17,13 @@ actor PreviewRenderer {
     private let cacheLimit = 3
 
     func render(url: URL, settings: EditSettings, geometry: Bool, maxPixelSize: CGFloat, makeThumbnail: Bool) -> PreviewResult? {
-        guard let source = source(for: url, maxPixelSize: maxPixelSize),
-              let (image, baseSize) = ImagePipeline.render(source, settings: settings, geometry: geometry),
+        guard let source = source(for: url, maxPixelSize: maxPixelSize) else { return nil }
+        // A crop is enlarged to fill the screen, so decode enough pixels for the cropped area.
+        // The crop tool shows the whole image; keep the current resolution there to avoid re-decoding.
+        if geometry {
+            source.ensureLongEdge(source.longEdgeNeeded(for: settings.crop, outputPixelSize: maxPixelSize))
+        }
+        guard let (image, baseSize) = ImagePipeline.render(source, settings: settings, geometry: geometry),
               let cgImage = context.createCGImage(image, from: image.extent, format: .RGBA8, colorSpace: ImagePipeline.sRGB)
         else { return nil }
 

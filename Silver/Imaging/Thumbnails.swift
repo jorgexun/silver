@@ -20,9 +20,10 @@ nonisolated enum Thumbnails {
 
     /// Thumbnail rendered through the edit pipeline.
     static func rendered(url: URL, settings: EditSettings) -> CGImage? {
-        // RAW decoding at a small scale is not much cheaper, but keeps memory low.
-        guard let source = SourceImage(url: url, maxPixelSize: maxPixelSize * 2),
-              let (image, _) = ImagePipeline.render(source, settings: settings, geometry: true)
+        // Oversample 2x for a crisper downscale.
+        guard let source = SourceImage(url: url, maxPixelSize: maxPixelSize * 2) else { return nil }
+        source.ensureLongEdge(source.longEdgeNeeded(for: settings.crop, outputPixelSize: maxPixelSize * 2))
+        guard let (image, _) = ImagePipeline.render(source, settings: settings, geometry: true)
         else { return nil }
         return downscale(image, maxPixelSize: maxPixelSize, context: context)
     }

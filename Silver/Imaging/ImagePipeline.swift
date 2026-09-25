@@ -11,9 +11,13 @@ import UniformTypeIdentifiers
 nonisolated final class SourceImage {
     let url: URL
     private let rawFilter: CIRAWFilter?
-    private let bitmap: CIImage?
+    private var bitmap: CIImage?
     private let asShotTemperature: Float
     private let asShotTint: Float
+    /// Oriented full-resolution size.
+    private let nativeSize: CGSize
+    /// Long edge the image is currently decoded at.
+    private(set) var decodedLongEdge: CGFloat
 
     var isRaw: Bool { rawFilter != nil }
 
@@ -21,39 +25,76 @@ nonisolated final class SourceImage {
     init?(url: URL, maxPixelSize: CGFloat?) {
         self.url = url
         if PhotoFile.isRaw(url), let raw = CIRAWFilter(imageURL: url) {
-            let native = raw.nativeSize
-            let longEdge = max(native.width, native.height)
-            if let maxPixelSize, longEdge > maxPixelSize {
-                raw.scaleFactor = Float(maxPixelSize / longEdge)
-            }
             // Scene-linear output with highlight headroom; tone mapping happens in ToneMapping.
             raw.boostAmount = 0
             raw.extendedDynamicRangeAmount = 2
+            guard let extent = raw.outputImage?.extent else { return nil }  // Lazy: no decoding yet.
             rawFilter = raw
-            bitmap = nil
             asShotTemperature = raw.neutralTemperature
             asShotTint = raw.neutralTint
+            nativeSize = extent.size
         } else {
-            guard let image = Self.loadBitmap(url: url, maxPixelSize: maxPixelSize) else { return nil }
+            guard let size = Self.bitmapSize(url: url) else { return nil }
             rawFilter = nil
-            bitmap = image
             asShotTemperature = 6500
             asShotTint = 0
+            nativeSize = size
+        }
+        decodedLongEdge = max(nativeSize.width, nativeSize.height)
+        setLongEdge(maxPixelSize)
+    }
+
+    /// Long edge to decode at so that `crop` comes out with a long side of at least `outputPixelSize`.
+    func longEdgeNeeded(for crop: CropRect, outputPixelSize: CGFloat) -> CGFloat {
+        let longEdge = max(nativeSize.width, nativeSize.height)
+        let fraction = max(crop.width * nativeSize.width / longEdge, crop.height * nativeSize.height / longEdge, 0.02)
+        return (outputPixelSize / fraction).rounded(.up)
+    }
+
+    /// Changes the decode resolution when the current one is too small, or much larger than needed.
+    func ensureLongEdge(_ needed: CGFloat) {
+        let target = min(needed, max(nativeSize.width, nativeSize.height))
+        if decodedLongEdge < target - 1 || decodedLongEdge > target * 1.5 {
+            setLongEdge(target)
         }
     }
 
-    private static func loadBitmap(url: URL, maxPixelSize: CGFloat?) -> CIImage? {
-        guard let maxPixelSize else {
-            return CIImage(contentsOf: url, options: [.applyOrientationProperty: true])
+    private func setLongEdge(_ maxPixelSize: CGFloat?) {
+        let nativeLongEdge = max(nativeSize.width, nativeSize.height)
+        let longEdge = min(maxPixelSize ?? nativeLongEdge, nativeLongEdge)
+        guard longEdge != decodedLongEdge else { return }
+        decodedLongEdge = longEdge
+        if let rawFilter {
+            rawFilter.scaleFactor = Float(longEdge / nativeLongEdge)
+        } else {
+            bitmap = nil  // Reloaded at the new size on next use.
         }
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
-        ]
-        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
-        return CIImage(cgImage: cgImage)
+    }
+
+    private static func bitmapSize(url: URL) -> CGSize? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = props[kCGImagePropertyPixelWidth] as? CGFloat,
+              let height = props[kCGImagePropertyPixelHeight] as? CGFloat
+        else { return nil }
+        let orientation = props[kCGImagePropertyOrientation] as? Int ?? 1
+        return orientation >= 5 ? CGSize(width: height, height: width) : CGSize(width: width, height: height)
+    }
+
+    private func loadBitmap() -> CIImage? {
+        if let bitmap { return bitmap }
+        let nativeLongEdge = max(nativeSize.width, nativeSize.height)
+        if decodedLongEdge >= nativeLongEdge {
+            bitmap = CIImage(contentsOf: url, options: [.applyOrientationProperty: true])
+        } else if let source = CGImageSourceCreateWithURL(url as CFURL, nil) {
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: decodedLongEdge,
+            ]
+            bitmap = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary).map { CIImage(cgImage: $0) }
+        }
+        return bitmap
     }
 
     /// The developed image with light and color adjustments applied (no geometry).
@@ -74,7 +115,7 @@ nonisolated final class SourceImage {
             }
             image = ToneMapping.raw(image)
         } else {
-            guard let bitmap else { return nil }
+            guard let bitmap = loadBitmap() else { return nil }
             image = bitmap
             if settings.exposure != 0 {
                 image = image.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: settings.exposure])
