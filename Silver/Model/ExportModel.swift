@@ -53,6 +53,10 @@ final class ExportModel {
 
     func present(jobs: [ExportJob]) {
         guard !jobs.isEmpty, !isExporting else { return }
+        if outputFolder == nil {
+            // The saved folder may have been on a drive that is connected now.
+            outputFolder = Bookmarks.resolve(forKey: Bookmarks.exportFolderKey)
+        }
         self.jobs = jobs
         phase = .configuring
         isPresented = true

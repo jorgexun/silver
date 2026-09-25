@@ -95,17 +95,17 @@ struct SilverCommands: Commands {
         CommandMenu("Photo") {
             Button("Previous Photo") { library.selectPrevious() }
                 .keyboardShortcut(.leftArrow, modifiers: [])
-                .disabled(library.photos.isEmpty)
+                .disabled(library.photos.isEmpty || library.isShowingSheet)
             Button("Next Photo") { library.selectNext() }
                 .keyboardShortcut(.rightArrow, modifiers: [])
-                .disabled(library.photos.isEmpty)
+                .disabled(library.photos.isEmpty || library.isShowingSheet)
             Divider()
             Button("Crop & Straighten") { library.toggleCrop() }
                 .keyboardShortcut("r", modifiers: [])
-                .disabled(library.activePhoto == nil)
+                .disabled(library.activePhoto == nil || library.isShowingSheet)
             Button("Show Original") { library.showOriginal.toggle() }
                 .keyboardShortcut("\\", modifiers: [])
-                .disabled(library.activePhoto == nil || library.isCropping || library.viewMode != .loupe)
+                .disabled(library.activePhoto == nil || library.isCropping || library.viewMode != .loupe || library.isShowingSheet)
             Divider()
             Button("Reset Adjustments") { library.resetAdjustments() }
                 .keyboardShortcut("r", modifiers: [.command, .shift, .option])
@@ -115,10 +115,10 @@ struct SilverCommands: Commands {
         CommandGroup(before: .sidebar) {
             Button("Grid") { library.viewMode = .grid }
                 .keyboardShortcut("g", modifiers: [])
-                .disabled(library.photos.isEmpty)
+                .disabled(library.photos.isEmpty || library.isShowingSheet)
             Button("Loupe") { library.viewMode = .loupe }
                 .keyboardShortcut("e", modifiers: [])
-                .disabled(library.activePhoto == nil)
+                .disabled(library.activePhoto == nil || library.isShowingSheet)
             Button(library.isInspectorPresented ? "Hide Adjustments" : "Show Adjustments") {
                 library.isInspectorPresented.toggle()
             }

@@ -113,7 +113,9 @@ nonisolated final class SourceImage {
             if settings.exposure != 0 {
                 image = image.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: settings.exposure])
             }
-            image = ToneMapping.raw(image, highlights: settings.highlights)
+            // Highlights works on the scene-linear data up to the brightest level in the image.
+            let top = settings.highlights == 0 ? 0 : brightestLevel(of: output, settings: settings) * pow(2, settings.exposure)
+            image = ToneMapping.raw(image, highlights: settings.highlights, top: top)
         } else {
             guard let bitmap = loadBitmap() else { return nil }
             image = bitmap
@@ -132,32 +134,58 @@ nonisolated final class SourceImage {
                 image = ToneMapping.shoulder(image)
             }
         }
-        return ImagePipeline.applyTone(settings, to: image, highlightsApplied: rawFilter != nil)
+        var tone = settings
+        if isRaw { tone.highlights = 0 }  // Already applied by ToneMapping.
+        return ImagePipeline.applyTone(tone, to: image)
+    }
+
+    private var brightestLevelCache: (temperature: Double, tint: Double, value: Double)?
+
+    /// Brightest scene value of the developed RAW (before exposure), measured on a fixed-size
+    /// downsample so previews and full-size exports agree. Cached per white balance.
+    private func brightestLevel(of image: CIImage, settings: EditSettings) -> Double {
+        if let cache = brightestLevelCache, cache.temperature == settings.temperature, cache.tint == settings.tint {
+            return cache.value
+        }
+        let scale = min(1, 512 / max(image.extent.width, image.extent.height))
+        let small = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale), highQualityDownsample: true)
+        let maximum = small
+            .applyingFilter("CIMaximumComponent")
+            .applyingFilter("CIAreaMaximum", parameters: [kCIInputExtentKey: CIVector(cgRect: small.extent)])
+        var pixel = [Float](repeating: 0, count: 4)
+        ImagePipeline.measureContext.render(
+            maximum, toBitmap: &pixel, rowBytes: 16,
+            bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBAf,
+            colorSpace: CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!
+        )
+        let value = pixel[0].isFinite ? max(Double(pixel[0]), 0) : 0
+        brightestLevelCache = (settings.temperature, settings.tint, value)
+        return value
     }
 }
 
 nonisolated enum ImagePipeline {
     static let sRGB = CGColorSpace(name: CGColorSpace.sRGB)!
 
-    /// Contrast, highlights, shadows, vibrance and saturation.
-    /// `highlightsApplied`: Highlights was already applied by RAW tone mapping.
-    static func applyTone(_ settings: EditSettings, to input: CIImage, highlightsApplied: Bool = false) -> CIImage {
-        var image = input
-        let highlights = highlightsApplied ? 0 : settings.highlights
+    static let measureContext = CIContext(options: [.name: "Silver.Measure", .cacheIntermediates: false])
 
-        if highlights < 0 || settings.shadows != 0 {
+    /// Contrast, highlights, shadows, vibrance and saturation.
+    static func applyTone(_ settings: EditSettings, to input: CIImage) -> CIImage {
+        var image = input
+
+        if settings.highlights < 0 || settings.shadows != 0 {
             let filter = CIFilter.highlightShadowAdjust()
             filter.inputImage = image
             filter.radius = 0  // Scale independent, so previews match full-size exports.
-            filter.highlightAmount = Float(1 + min(highlights, 0) / 100 * 0.7)
+            filter.highlightAmount = Float(1 + min(settings.highlights, 0) / 100 * 0.7)
             filter.shadowAmount = Float(settings.shadows / 100 * 0.6)
             image = filter.outputImage ?? image
         }
 
-        if settings.contrast != 0 || highlights > 0 {
+        if settings.contrast != 0 || settings.highlights > 0 {
             // Tone curve in a perceptual (sRGB gamma) space.
             let c = settings.contrast / 100
-            let h = max(highlights, 0) / 100
+            let h = max(settings.highlights, 0) / 100
             let curve = CIFilter.toneCurve()
             curve.inputImage = image.applyingFilter("CILinearToSRGBToneCurve")
             curve.point0 = CGPoint(x: 0, y: 0)
@@ -205,7 +233,9 @@ nonisolated enum ImagePipeline {
             image = image.transformed(by: transform, highQualityDownsample: true)
         }
 
-        let crop = settings.crop
+        // No-op for crops made in the crop tool; keeps pasted or hand-edited crops inside the
+        // straightened image so the output never has empty corners.
+        let crop = CropGeometry.fitted(settings.crop, angle: settings.straighten, imageSize: extent.size)
         let minX = (extent.minX + crop.minX * extent.width).rounded(.up)
         let maxX = (extent.minX + crop.maxX * extent.width).rounded(.down)
         // Flip y: crop is top-left based, Core Image is bottom-left based.

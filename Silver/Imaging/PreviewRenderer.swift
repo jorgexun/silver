@@ -34,10 +34,6 @@ actor PreviewRenderer {
         return PreviewResult(image: cgImage, baseSize: baseSize, thumbnail: thumbnail)
     }
 
-    func evict(url: URL) {
-        sources.removeAll { $0.url == url }
-    }
-
     func removeAll() {
         sources.removeAll()
     }

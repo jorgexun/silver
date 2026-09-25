@@ -24,7 +24,7 @@ nonisolated enum ToneMapping {
     /// Curve for RAW files: follows Core Image's default RAW tone curve (measured from its
     /// output on Leica M11 files) through shadows and midtones, so the default look is unchanged,
     /// then continues into a long shoulder where the default curve would clip at 1.
-    private static let raw = makeCurve(knee: rawKnee, rawTone)
+    private static let raw = makeCurve(blendFrom: rawTone(rawKnee), rawTone)
     private static let rawKnee = 0.46
 
     private static func rawTone(_ x: Double) -> Double {
@@ -35,34 +35,60 @@ nonisolated enum ToneMapping {
         return kneeValue + (1 - kneeValue) * t / (1 + t)
     }
 
-    /// RAW curves with a Highlights adjustment, keyed by slider value.
-    private static let highlightCurves = Mutex<[Int: Curve]>([:])
+    /// Recently used RAW curves with a Highlights adjustment, most recent last.
+    private static let highlightCurves = Mutex<[(key: HighlightKey, curve: Curve)]>([])
+    private static let highlightCacheLimit = 32
 
-    private static func rawCurve(highlights: Double) -> Curve {
-        let key = Int(highlights.rounded())
-        guard key != 0 else { return raw }
-        if let cached = highlightCurves.withLock({ $0[key] }) { return cached }
-        // Negative values pull highlights down (recovery); positive values push them up.
-        let amount = key < 0 ? Double(-key) / 100 * 0.75 : -Double(key) / 100 * 0.5
-        let curve = makeCurve(knee: rawKnee) { rawTone(shiftHighlights($0, amount: amount)) }
+    private struct HighlightKey: Equatable {
+        let highlights: Int
+        /// `log2(top)` in 1/50 stop steps.
+        let top: Int
+    }
+
+    private static func rawCurve(highlights: Double, top: Double) -> Curve {
+        let highlights = highlights.isFinite ? min(max(highlights, -100), 100) : 0
+        let amount = highlightAmount(highlights)
+        guard amount != 0, top.isFinite, top > highlightPivot * 1.2 else { return raw }
+        let key = HighlightKey(highlights: Int(highlights.rounded()), top: Int((log2(min(top, domain)) * 50).rounded()))
+        let cached = highlightCurves.withLock { cache -> Curve? in
+            guard let index = cache.firstIndex(where: { $0.key == key }) else { return nil }
+            let entry = cache.remove(at: index)
+            cache.append(entry)
+            return entry.curve
+        }
+        if let cached { return cached }
+
+        let roundedTop = pow(2, Double(key.top) / 50)
+        let curve = makeCurve(blendFrom: rawTone(rawKnee)) { rawTone(shiftHighlights($0, amount: amount, top: roundedTop)) }
         highlightCurves.withLock { cache in
-            if cache.count >= 64 { cache.removeAll() }
-            cache[key] = curve
+            cache.append((key, curve))
+            if cache.count > highlightCacheLimit { cache.removeFirst() }
         }
         return curve
     }
 
-    /// Scales the distance above an upper-midtone pivot, measured in stops, by `1 - amount`.
-    /// Works on scene-linear values before the shoulder, so highlight detail that the curve
-    /// would squeeze into the last few output levels gets spread back out. The transition
-    /// around the pivot is gradual, leaving midtones and shadows unchanged.
-    private static func shiftHighlights(_ x: Double, amount: Double) -> Double {
-        guard x > 0 else { return x }
-        let pivot = 0.25
-        let softness = 2.0
-        let stops = log2(x / pivot)
-        let aboveStops = log1p(exp(softness * stops)) / softness  // ≈ 0 below the pivot, ≈ stops above
-        return x * pow(2, -amount * aboveStops)
+    /// Slider value (-100...100) to reshaping strength. Limits keep the curve monotonic:
+    /// the log-space slope is `1 - amount * bump'`, and `bump'` ranges from -6.75 to 2.25.
+    private static func highlightAmount(_ highlights: Double) -> Double {
+        let h = highlights / 100
+        return h < 0 ? -h * 0.4 : -h * 0.13
+    }
+
+    /// Scene value where Highlights starts; midtones below it are never touched.
+    private static let highlightPivot = 0.3
+
+    /// Reshapes tones between the pivot and `top` (the brightest level in the image), in stops.
+    /// Positive `amount` darkens the upper highlights and spreads out the tones just below `top`,
+    /// which the shoulder would otherwise squeeze together; negative brightens them. The pivot
+    /// and `top` map to themselves, and the change fades in with zero slope at the pivot, so
+    /// midtones and the white level stay exactly as they are.
+    private static func shiftHighlights(_ x: Double, amount: Double, top: Double) -> Double {
+        let range = log2(top / highlightPivot)
+        guard x > highlightPivot, x < top, range > 0 else { return x }
+        let stops = log2(x / highlightPivot)
+        let t = stops / range
+        let bump = 6.75 * t * t * (1 - t)  // 0 at both ends, 1 at t = 2/3, flat at the pivot
+        return highlightPivot * pow(2, stops - amount * range * bump)
     }
 
     /// (scene-linear input, output) pairs of Core Image's default RAW rendering (`boostAmount` 1).
@@ -82,12 +108,15 @@ nonisolated enum ToneMapping {
     }
 
     /// Identity up to a knee, then a smooth shoulder. For already-rendered images (JPEG).
-    private static let shoulder = makeCurve(knee: 0.75) { x in
+    private static let shoulder = makeCurve(blendFrom: 0.75) { x in
         let knee = 0.75
         return x <= knee ? x : knee + (1 - knee) * (1 - exp(-(x - knee) / (1 - knee)))
     }
 
-    static func raw(_ image: CIImage, highlights: Double) -> CIImage { apply(rawCurve(highlights: highlights), to: image) }
+    /// - Parameter top: Brightest scene value in the image (after exposure); Highlights keeps it fixed.
+    static func raw(_ image: CIImage, highlights: Double, top: Double) -> CIImage {
+        apply(rawCurve(highlights: highlights, top: top), to: image)
+    }
     static func shoulder(_ image: CIImage) -> CIImage { apply(shoulder, to: image) }
 
     private static func apply(_ curve: Curve, to image: CIImage) -> CIImage {
@@ -110,27 +139,19 @@ nonisolated enum ToneMapping {
         ])
     }
 
-    /// Colors are eased toward white only above `knee`, where the shoulder compresses them.
-    private static func makeCurve(knee: Double, _ f: @escaping (Double) -> Double) -> Curve {
-        let mapped = { (x: Double) in min(max(f(x), 0), 1) }
-        let kneeValue = mapped(knee)
-        return Curve(
-            ratio: table { x in x > 1e-6 ? mapped(x) / x : mapped(1e-6) / 1e-6 },
-            white: table(mapped),
-            mask: table { x in pow(max(mapped(x) - kneeValue, 0) / (1 - kneeValue), 2) }
-        )
-    }
-
-    /// Samples `f(m)` on a grid that is uniform in `m^(1/4)`.
-    private static func table(_ f: (Double) -> Double) -> Data {
+    /// Samples `f` on a grid that is uniform in `m^(1/4)`. Colors are eased toward white only
+    /// where the output is above `blendFrom`, which is where the shoulder compresses them.
+    private static func makeCurve(blendFrom: Double, _ f: (Double) -> Double) -> Curve {
         let maxEncoded = pow(domain, encodePower)
-        var values: [Float] = []
-        values.reserveCapacity(samples * 3)
+        var ratio: [Float] = [], white: [Float] = [], mask: [Float] = []
         for i in 0..<samples {
-            let encoded = maxEncoded * Double(i) / Double(samples - 1)
-            let value = Float(f(pow(encoded, 1 / encodePower)))
-            values += [value, value, value]
+            let x = max(pow(maxEncoded * Double(i) / Double(samples - 1), 1 / encodePower), 1e-6)
+            let y = min(max(f(x), 0), 1)
+            ratio += Array(repeating: Float(y / x), count: 3)
+            white += Array(repeating: Float(y), count: 3)
+            mask += Array(repeating: Float(pow(max(y - blendFrom, 0) / (1 - blendFrom), 2)), count: 3)
         }
-        return values.withUnsafeBufferPointer { Data(buffer: $0) }
+        func data(_ values: [Float]) -> Data { values.withUnsafeBufferPointer { Data(buffer: $0) } }
+        return Curve(ratio: data(ratio), white: data(white), mask: data(mask))
     }
 }

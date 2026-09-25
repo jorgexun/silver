@@ -62,18 +62,25 @@ extension EditSettings: Codable {
 
     static let currentVersion = 1
 
+    /// Values are clamped to the slider ranges, so a hand-edited or damaged sidecar can't
+    /// produce settings the UI could never create.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        exposure = try c.decodeIfPresent(Double.self, forKey: .exposure) ?? 0
-        contrast = try c.decodeIfPresent(Double.self, forKey: .contrast) ?? 0
-        highlights = try c.decodeIfPresent(Double.self, forKey: .highlights) ?? 0
-        shadows = try c.decodeIfPresent(Double.self, forKey: .shadows) ?? 0
-        temperature = try c.decodeIfPresent(Double.self, forKey: .temperature) ?? 0
-        tint = try c.decodeIfPresent(Double.self, forKey: .tint) ?? 0
-        vibrance = try c.decodeIfPresent(Double.self, forKey: .vibrance) ?? 0
-        saturation = try c.decodeIfPresent(Double.self, forKey: .saturation) ?? 0
-        crop = try c.decodeIfPresent(CropRect.self, forKey: .crop) ?? .full
-        straighten = try c.decodeIfPresent(Double.self, forKey: .straighten) ?? 0
+        func value(_ key: CodingKeys, in range: ClosedRange<Double>) -> Double {
+            guard let v = try? c.decodeIfPresent(Double.self, forKey: key), v.isFinite else { return 0 }
+            return min(max(v, range.lowerBound), range.upperBound)
+        }
+        exposure = value(.exposure, in: -5...5)
+        contrast = value(.contrast, in: -100...100)
+        highlights = value(.highlights, in: -100...100)
+        shadows = value(.shadows, in: -100...100)
+        temperature = value(.temperature, in: -100...100)
+        tint = value(.tint, in: -100...100)
+        vibrance = value(.vibrance, in: -100...100)
+        saturation = value(.saturation, in: -100...100)
+        straighten = value(.straighten, in: -45...45)
+        let decodedCrop = try? c.decodeIfPresent(CropRect.self, forKey: .crop)
+        crop = decodedCrop.flatMap { $0.isValid ? $0 : nil } ?? .full
         aspectRatio = (try? c.decodeIfPresent(AspectRatio.self, forKey: .aspectRatio)) ?? .original
     }
 
@@ -135,6 +142,14 @@ nonisolated struct CropRect: Codable, Equatable, Hashable, Sendable {
 
     init(centerX: Double, centerY: Double, width: Double, height: Double) {
         self.init(x: centerX - width / 2, y: centerY - height / 2, width: width, height: height)
+    }
+
+    /// Finite, at least the minimum size, and inside the image.
+    var isValid: Bool {
+        let tolerance = 1e-6
+        return [x, y, width, height].allSatisfy(\.isFinite)
+            && width >= CropGeometry.minimumSize && height >= CropGeometry.minimumSize
+            && x >= -tolerance && y >= -tolerance && maxX <= 1 + tolerance && maxY <= 1 + tolerance
     }
 
     func interpolated(to other: CropRect, _ t: Double) -> CropRect {

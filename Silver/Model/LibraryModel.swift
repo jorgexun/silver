@@ -52,7 +52,6 @@ final class LibraryModel {
     // MARK: Preview
 
     private(set) var preview: PreviewImage?
-    private(set) var isRenderingPreview = false
     private let renderer = PreviewRenderer()
     private var renderTask: Task<Void, Never>?
     private var renderPending = false
@@ -79,7 +78,8 @@ final class LibraryModel {
 
     private var undoStack: [EditRecord] = []
     private var redoStack: [EditRecord] = []
-    private var interactiveStart: EditSettings?
+    /// Photo and settings when the current slider drag began.
+    private var interactiveStart: (id: Photo.ID, settings: EditSettings)?
     private var cropSessionStart: EditSettings?
     private var straightenBase: CropRect?
 
@@ -135,7 +135,7 @@ final class LibraryModel {
 
     func removeFolder(_ root: FolderNode) {
         if let folderURL, SourceFolders.url(folderURL, isInside: root.url) {
-            closeFolder()
+            closeFolder(forget: true)
         }
         folders.remove(root)
     }
@@ -143,15 +143,45 @@ final class LibraryModel {
     /// Restores sidebar folders and the last selected folder.
     func restoreSession() {
         folders.restore()
+        openSavedFolder()
+        observeVolumes()
+    }
+
+    private func openSavedFolder() {
         if let path = UserDefaults.standard.string(forKey: Self.selectedFolderKey) {
             let url = SourceFolders.normalized(URL(fileURLWithPath: path))
-            if folders.root(containing: url) != nil, FileManager.default.fileExists(atPath: url.path) {
+            if folders.root(containing: url)?.isAvailable == true, FileManager.default.fileExists(atPath: url.path) {
                 openFolder(url)
                 folders.reveal(url)
                 return
             }
         }
-        if let first = folders.roots.first { openFolder(first.url) }
+        if let first = folders.roots.first(where: \.isAvailable) { openFolder(first.url) }
+    }
+
+    private var volumeObservers: [NSObjectProtocol] = []
+
+    /// Folders on external drives come and go; re-check them when volumes change or the app
+    /// becomes active.
+    private func observeVolumes() {
+        let workspace = NSWorkspace.shared.notificationCenter
+        // Delivered on the main queue; the model lives for the whole app session.
+        let handler: @Sendable (Notification) -> Void = { [self] _ in
+            MainActor.assumeIsolated { volumesChanged() }
+        }
+        volumeObservers = [
+            workspace.addObserver(forName: NSWorkspace.didMountNotification, object: nil, queue: .main, using: handler),
+            workspace.addObserver(forName: NSWorkspace.didUnmountNotification, object: nil, queue: .main, using: handler),
+            NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main, using: handler),
+        ]
+    }
+
+    private func volumesChanged() {
+        guard folders.refreshAvailability() else { return }
+        if let folderURL, folders.root(containing: folderURL)?.isAvailable != true {
+            closeFolder(forget: false)  // Reopened when the drive comes back.
+        }
+        if folderURL == nil { openSavedFolder() }
     }
 
     private static let selectedFolderKey = "SelectedFolderPath"
@@ -191,12 +221,12 @@ final class LibraryModel {
         }
     }
 
-    private func closeFolder() {
+    private func closeFolder(forget: Bool) {
         endCrop()
         flushSaves()
         resetFolderState()
         folderURL = nil
-        UserDefaults.standard.removeObject(forKey: Self.selectedFolderKey)
+        if forget { UserDefaults.standard.removeObject(forKey: Self.selectedFolderKey) }
     }
 
     private func resetFolderState() {
@@ -298,6 +328,12 @@ final class LibraryModel {
     private func setActive(_ id: Photo.ID) {
         guard id != activeID else { return }
         endCrop()
+        if interactiveStart != nil {
+            // A slider drag spans the switch: record it for the photo it started on, then
+            // keep tracking the drag for the new photo.
+            endInteractiveEdit()
+            if let photo = photosByID[id] { interactiveStart = (id, photo.settings) }
+        }
         activeID = id
         showOriginal = false
         if let photo = photosByID[id], photo.metadata == nil {
@@ -323,14 +359,14 @@ final class LibraryModel {
     }
 
     func beginInteractiveEdit() {
-        guard !isCropping else { return }
-        interactiveStart = activePhoto?.settings
+        guard !isCropping, let photo = activePhoto else { return }
+        interactiveStart = (photo.id, photo.settings)
     }
 
     func endInteractiveEdit() {
         defer { interactiveStart = nil }
-        guard let start = interactiveStart, let photo = activePhoto, photo.settings != start else { return }
-        pushUndo(EditRecord(name: "Edit", changes: [Change(id: photo.id, before: start, after: photo.settings)]))
+        guard let start = interactiveStart, let photo = photosByID[start.id], photo.settings != start.settings else { return }
+        pushUndo(EditRecord(name: "Edit", changes: [Change(id: photo.id, before: start.settings, after: photo.settings)]))
     }
 
     /// Applies new settings to several photos as one undoable action.
@@ -369,6 +405,9 @@ final class LibraryModel {
     }
 
     var canPaste: Bool { clipboard != nil && activePhoto != nil }
+
+    /// Single-key shortcuts are disabled while a sheet is up.
+    var isShowingSheet: Bool { export.isPresented || isShowingCopyOptions }
 
     func pasteAdjustments(toSelected: Bool) {
         guard let clipboard else { return }
@@ -532,7 +571,6 @@ final class LibraryModel {
                 let original = showOriginal
                 let geometry = !isCropping && !original
                 let settings = original ? EditSettings.default : photo.settings
-                isRenderingPreview = true
                 let result = await renderer.render(
                     url: photo.url,
                     settings: settings,
@@ -540,7 +578,6 @@ final class LibraryModel {
                     maxPixelSize: previewPixelSize,
                     makeThumbnail: geometry
                 )
-                isRenderingPreview = false
 
                 guard let result else {
                     if photo.id == activeID, viewMode == .loupe {
@@ -579,31 +616,45 @@ final class LibraryModel {
                 let batch = thumbnailQueue.prefix(4).compactMap { photosByID[$0] }
                 thumbnailQueue.removeFirst(min(4, thumbnailQueue.count))
 
-                let jobs = batch.map { photo in
-                    let url = photo.url
-                    // Photos without a thumbnail get the fast embedded preview first.
-                    let settings: EditSettings? = photo.isEdited && photo.thumbnail != nil ? photo.settings : nil
-                    let needsMetadata = photo.metadata == nil
-                    return (photo, settings, Task.detached(priority: .utility) { () -> (CGImage?, PhotoMetadata?) in
-                        let metadata = needsMetadata ? PhotoMetadata.load(url: url) : nil
-                        let image = settings.map { Thumbnails.rendered(url: url, settings: $0) } ?? Thumbnails.embedded(url: url)
-                        return (image, metadata)
-                    })
+                // Photos without a thumbnail get the fast embedded preview first.
+                let jobs = batch.map { photo -> (Photo, EditSettings?) in
+                    (photo, photo.isEdited && photo.thumbnail != nil ? photo.settings : nil)
                 }
-                for (photo, settings, task) in jobs {
-                    let (image, metadata) = await task.value
-                    if let metadata { photo.metadata = metadata }
-                    guard let image else { continue }
-                    if let settings {
-                        // Drop stale renders; a newer request is already queued.
-                        if photo.settings == settings { photo.thumbnail = image }
-                    } else if !photo.isEdited || photo.thumbnail == nil {
-                        photo.thumbnail = image
-                        if photo.isEdited { enqueueThumbnails([photo]) }
-                    }
+                // Embedded previews load in parallel. Rendered ones decode the whole RAW, which
+                // doesn't get faster in parallel but uses much more memory, so they run one at a time.
+                let embedded = jobs.filter { $0.1 == nil }.map { ($0.0, loadThumbnail(for: $0.0, renderedWith: nil)) }
+                for (photo, task) in embedded {
+                    setThumbnail(await task.value, for: photo, renderedWith: nil)
+                }
+                for case let (photo, settings?) in jobs {
+                    setThumbnail(await loadThumbnail(for: photo, renderedWith: settings).value, for: photo, renderedWith: settings)
                 }
             }
             thumbnailTask = nil
+        }
+    }
+
+    /// Loads metadata if missing, and either the embedded preview or a render with `settings`.
+    private func loadThumbnail(for photo: Photo, renderedWith settings: EditSettings?) -> Task<(CGImage?, PhotoMetadata?), Never> {
+        let url = photo.url
+        let needsMetadata = photo.metadata == nil
+        return Task.detached(priority: .utility) {
+            let metadata = needsMetadata ? PhotoMetadata.load(url: url) : nil
+            let image = settings.map { Thumbnails.rendered(url: url, settings: $0) } ?? Thumbnails.embedded(url: url)
+            return (image, metadata)
+        }
+    }
+
+    private func setThumbnail(_ result: (CGImage?, PhotoMetadata?), for photo: Photo, renderedWith settings: EditSettings?) {
+        let (image, metadata) = result
+        if let metadata { photo.metadata = metadata }
+        guard let image else { return }
+        if let settings {
+            // Drop stale renders; a newer request is already queued.
+            if photo.settings == settings { photo.thumbnail = image }
+        } else if !photo.isEdited || photo.thumbnail == nil {
+            photo.thumbnail = image
+            if photo.isEdited { enqueueThumbnails([photo]) }
         }
     }
 

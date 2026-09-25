@@ -7,15 +7,18 @@ final class FolderNode: Identifiable {
     let url: URL
     let name: String
     let hasSubfolders: Bool
+    /// False for a root whose volume is not connected; it stays in the sidebar until it returns.
+    let isAvailable: Bool
     var children: [FolderNode]?
     var isExpanded = false
 
     var id: URL { url }
 
-    init(url: URL, hasSubfolders: Bool) {
+    init(url: URL, hasSubfolders: Bool, isAvailable: Bool = true) {
         self.url = url
-        self.name = FileManager.default.displayName(atPath: url.path)
+        self.name = isAvailable ? FileManager.default.displayName(atPath: url.path) : url.lastPathComponent
         self.hasSubfolders = hasSubfolders
+        self.isAvailable = isAvailable
     }
 }
 
@@ -57,7 +60,8 @@ final class SourceFolders {
 
     // MARK: - Roots
 
-    /// Resolves saved bookmarks and starts accessing them.
+    /// Resolves saved bookmarks and starts accessing them. Folders that can't be reached
+    /// (e.g. on a disconnected drive) are kept as unavailable roots.
     func restore() {
         var saved = UserDefaults.standard.array(forKey: Self.bookmarksKey) as? [Data] ?? []
         if saved.isEmpty, let legacy = UserDefaults.standard.data(forKey: Bookmarks.legacyLibraryFolderKey) {
@@ -65,14 +69,42 @@ final class SourceFolders {
             UserDefaults.standard.removeObject(forKey: Bookmarks.legacyLibraryFolderKey)
         }
         for data in saved {
-            guard let (url, isStale) = Bookmarks.resolve(data) else { continue }
-            let key = Self.normalized(url)
-            guard bookmarks[key] == nil else { continue }
-            bookmarks[key] = isStale ? (Bookmarks.data(for: url) ?? data) : data
-            roots.append(makeNode(key))
+            if let (url, isStale) = Bookmarks.resolve(data) {
+                let key = Self.normalized(url)
+                guard bookmarks[key] == nil else { continue }
+                bookmarks[key] = isStale ? (Bookmarks.data(for: url) ?? data) : data
+                roots.append(makeNode(key))
+            } else if let location = Bookmarks.location(of: data) {
+                let key = Self.normalized(location)
+                guard bookmarks[key] == nil else { continue }
+                bookmarks[key] = data
+                roots.append(FolderNode(url: key, hasSubfolders: false, isAvailable: false))
+            }
         }
         saveBookmarks()
         roots.forEach(restoreExpansion)
+    }
+
+    /// Re-checks roots after volumes are mounted or ejected. Returns true if any root changed.
+    @discardableResult
+    func refreshAvailability() -> Bool {
+        var changed = false
+        for (index, root) in roots.enumerated() {
+            if root.isAvailable {
+                guard !FileManager.default.fileExists(atPath: root.url.path) else { continue }
+                root.url.stopAccessingSecurityScopedResource()
+                roots[index] = FolderNode(url: root.url, hasSubfolders: false, isAvailable: false)
+                changed = true
+            } else if let data = bookmarks[root.url], let (url, isStale) = Bookmarks.resolve(data) {
+                if isStale, let fresh = Bookmarks.data(for: url) { bookmarks[root.url] = fresh }
+                let node = makeNode(root.url)
+                roots[index] = node
+                restoreExpansion(of: node)
+                changed = true
+            }
+        }
+        if changed { saveBookmarks() }
+        return changed
     }
 
     /// Adds folders chosen by the user. Returns the added (or already present) roots.
@@ -82,9 +114,14 @@ final class SourceFolders {
         for url in urls {
             let key = Self.normalized(url)
             added.append(key)
-            guard bookmarks[key] == nil, let data = Bookmarks.data(for: url) else { continue }
+            let existing = roots.firstIndex { $0.url == key }
+            guard existing.map({ !roots[$0].isAvailable }) ?? true, let data = Bookmarks.data(for: url) else { continue }
             bookmarks[key] = data
-            roots.append(makeNode(key))
+            if let existing {
+                roots[existing] = makeNode(key)  // Re-added while it was shown as unavailable.
+            } else {
+                roots.append(makeNode(key))
+            }
         }
         roots.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         saveBookmarks()
@@ -94,7 +131,7 @@ final class SourceFolders {
     func remove(_ root: FolderNode) {
         roots.removeAll { $0 === root }
         bookmarks[root.url] = nil
-        root.url.stopAccessingSecurityScopedResource()
+        if root.isAvailable { root.url.stopAccessingSecurityScopedResource() }
         expandedPaths = expandedPaths.filter { !Self.url(URL(fileURLWithPath: $0), isInside: root.url) }
         saveBookmarks()
         saveExpansion()
@@ -118,6 +155,7 @@ final class SourceFolders {
     // MARK: - Expansion
 
     func setExpanded(_ node: FolderNode, _ expanded: Bool) {
+        guard node.isAvailable else { return }
         node.isExpanded = expanded
         if expanded {
             expandedPaths.insert(node.url.path)
@@ -130,7 +168,7 @@ final class SourceFolders {
 
     /// Expands the ancestors of `url` so it is visible in the sidebar.
     func reveal(_ url: URL) {
-        guard let root = root(containing: url) else { return }
+        guard let root = root(containing: url), root.isAvailable else { return }
         let target = Self.normalized(url)
         Task {
             var node = root
@@ -150,7 +188,7 @@ final class SourceFolders {
     }
 
     private func restoreExpansion(of node: FolderNode) {
-        guard expandedPaths.contains(node.url.path) else { return }
+        guard node.isAvailable, expandedPaths.contains(node.url.path) else { return }
         node.isExpanded = true
         loadChildren(of: node)
     }

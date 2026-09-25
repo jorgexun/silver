@@ -14,6 +14,7 @@ struct SidebarView: View {
                 ForEach(folders.rows) { row in
                     FolderRow(row: row)
                         .tag(row.node.url)
+                        .selectionDisabled(!row.node.isAvailable)
                         .contextMenu { contextMenu(for: row) }
                 }
             }
@@ -43,12 +44,14 @@ struct SidebarView: View {
 
     @ViewBuilder
     private func contextMenu(for row: SourceFolders.Row) -> some View {
-        Button("Show in Finder") {
-            NSWorkspace.shared.activateFileViewerSelecting([row.node.url])
-        }
-        Button("Reload") {
-            library.folders.refresh(row.node)
-            if library.folderURL == row.node.url { library.reloadFolder() }
+        if row.node.isAvailable {
+            Button("Show in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([row.node.url])
+            }
+            Button("Reload") {
+                library.folders.refresh(row.node)
+                if library.folderURL == row.node.url { library.reloadFolder() }
+            }
         }
         if row.isRoot {
             Divider()
@@ -81,11 +84,14 @@ private struct FolderRow: View {
                     Color.clear.frame(width: 14, height: 14)
                 }
             }
-            Label(node.name, systemImage: row.isRoot ? "folder.fill" : "folder")
+            Label(node.name, systemImage: !node.isAvailable ? "externaldrive.badge.xmark" : row.isRoot ? "folder.fill" : "folder")
                 .lineLimit(1)
                 .truncationMode(.middle)
         }
         .padding(.leading, CGFloat(row.depth) * 14)
-        .help(node.url.path(percentEncoded: false))
+        .foregroundStyle(node.isAvailable ? .primary : .tertiary)
+        .help(node.isAvailable
+              ? node.url.path(percentEncoded: false)
+              : "\(node.url.path(percentEncoded: false)) is not available. Connect its drive to use it.")
     }
 }
