@@ -253,6 +253,34 @@ DNG SDK 只是参考渲染。Lightroom 从 PV2012（Lightroom 4，2012）开始�
 
 ---
 
+## 附录 A：实施状态与局部 Highlights / Shadows 方案（2026-09-25）
+
+§6 建议的实施情况：
+- **第 1–4 条已实施**（commit `2975815`）。其中白点最终采用固定场景白 6.0：按图测量白点每张照片要多花约 0.12 s，所以放弃了。
+- **第 5、6 条暂缓，尚未开发。**
+
+以下是第 5 条（局部 Highlights / Shadows）确定的方案，思路与 darktable tone equalizer 相同，是 Lightroom Local Laplacian 效果的单尺度近似：
+
+1. **输入**：白平衡、曝光之后，全局曲线之前的场景线性数据（此时还保留着高光余量）。取亮度，转为 `L = log2(Y)`。
+2. **求基底**：把 L 缩到固定尺寸（长边约 512），做自引导的 `CIGuidedFilter`。ε 取约 0.5²，即半档以内的起伏算纹理，更大的跳变算边缘。尺寸固定，所以预览和导出的基底完全一致，而且全程在 GPU 上，不需要读回 CPU。
+3. **放大**：用 `CIEdgePreserveUpsampleFilter` 以原图为参考放大基底 B，保持边缘锐利、不产生光晕。
+4. **每像素调整量**：`Δ = Shadows · w_s(B) − Highlights · w_h(B)`，单位是档。w_h 从中灰 +1 档附近开始平滑升到 1，w_s 从深暗处的 1 平滑降到中灰附近的 0。做成一维查找表。
+5. **局部曝光**：`RGB × 2^Δ`，三通道同一系数，所以色相不变。细节（像素 / 基底）被原样保留。
+6. **全局曲线**：之后照常走 `rgbTone` 内核。高光基底被压下后落到曲线斜率更大的区域，细节随之被拉开。
+
+替换关系：
+- Shadows 由此替换现在全局的 `CIHighlightShadowAdjust`。
+- RAW 的 Highlights 由此替换现在的对数区间重分配。是否保留部分全局成分，看原型效果再定。
+
+风险：
+- 强设置下可能出现轻微光晕或梯度反转（单尺度不如多尺度金字塔）。
+- 提亮阴影会放大噪点。
+- 编辑过的缩略图必须走同一流程。
+
+下一步：先做命令行原型，对比全局版和局部版的效果、光晕和耗时，再决定是否接入 App。第 6 条（Whites / Blacks）需要新增滑块和 sidecar 字段。
+
+---
+
 ## 参考资料
 
 - Adobe DNG SDK 源码（GitHub 镜像）：[dng_render.cpp](https://github.com/aizvorski/dng_sdk/blob/master/source/dng_render.cpp)（曝光斜坡、负曝光曲线、ACR3 默认曲线、渲染顺序）、`dng_reference.cpp`（`RefBaselineRGBTone`）；Android 镜像：[dng_render.cpp](https://android.googlesource.com/platform/external/dng_sdk/+/refs/heads/master/source/dng_render.cpp)
