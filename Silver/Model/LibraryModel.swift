@@ -6,6 +6,23 @@ enum ViewMode: Hashable {
     case loupe
 }
 
+/// 100% view of the active photo.
+struct ZoomState: Equatable {
+    let photoID: Photo.ID
+    /// Clicked point, normalized to the displayed image (top-left origin).
+    let focus: CGPoint
+    /// Where that point was in the canvas, normalized to the canvas size; it stays under the cursor.
+    let anchor: CGPoint
+}
+
+/// Full-resolution pixels for part of the active photo, shown at 100%.
+struct DetailImage {
+    let photoID: Photo.ID
+    let image: CGImage
+    /// Area covered, in full-resolution output pixels (top-left origin).
+    let rect: CGRect
+}
+
 struct PreviewImage {
     let photoID: Photo.ID
     let image: CGImage
@@ -38,6 +55,7 @@ final class LibraryModel {
                 requestPreview()
             } else {
                 endCrop()
+                exitZoom()
             }
         }
     }
@@ -52,6 +70,21 @@ final class LibraryModel {
     // MARK: Preview
 
     private(set) var preview: PreviewImage?
+
+    // MARK: Zoom
+
+    private(set) var zoom: ZoomState?
+    /// Full-resolution output size of the zoomed photo, once known.
+    private(set) var zoomFullSize: CGSize?
+    private(set) var detail: DetailImage?
+    /// Visible area plus a margin, in full-resolution output pixels.
+    private var detailViewport: CGRect?
+    /// Center of the visible area, normalized to the image; carried over to the next photo.
+    private var zoomCenter = CGPoint(x: 0.5, y: 0.5)
+    private var detailTask: Task<Void, Never>?
+    private var detailPending = false
+    /// Edits made while zoomed only re-render the visible detail; the fit preview catches up on exit.
+    private var previewStaleWhileZoomed = false
     private let renderer = PreviewRenderer()
     private var renderTask: Task<Void, Never>?
     private var renderPending = false
@@ -334,6 +367,13 @@ final class LibraryModel {
             endInteractiveEdit()
             if let photo = photosByID[id] { interactiveStart = (id, photo.settings) }
         }
+        if zoom != nil {
+            // Stay at 100% on the same part of the frame, e.g. to compare focus across a burst.
+            zoom = ZoomState(photoID: id, focus: zoomCenter, anchor: CGPoint(x: 0.5, y: 0.5))
+            zoomFullSize = nil
+            detail = nil
+            detailViewport = nil
+        }
         activeID = id
         showOriginal = false
         if let photo = photosByID[id], photo.metadata == nil {
@@ -462,6 +502,7 @@ final class LibraryModel {
     func beginCrop() {
         guard let photo = activePhoto, !isCropping else { return }
         viewMode = .loupe
+        exitZoom(refreshPreview: false)
         showOriginal = false
         cropSessionStart = photo.settings
         isCropping = true
@@ -556,6 +597,12 @@ final class LibraryModel {
             preview = nil
             return
         }
+        if zoom != nil {
+            // Keep the RAW decoder at full resolution while zoomed.
+            previewStaleWhileZoomed = true
+            requestDetail()
+            return
+        }
         guard viewMode == .loupe || forThumbnail else { return }
         renderPending = true
         renderForThumbnail = renderForThumbnail || forThumbnail
@@ -594,6 +641,80 @@ final class LibraryModel {
                 }
             }
             renderTask = nil
+        }
+    }
+
+    // MARK: - Zoom
+
+    /// Switches between fit-to-window and 100% (one image pixel per screen pixel). `focus` is
+    /// the image point to zoom into and `anchor` where it should appear in the canvas, both
+    /// normalized; the defaults zoom into the center.
+    func toggleZoom(focus: CGPoint = CGPoint(x: 0.5, y: 0.5), anchor: CGPoint = CGPoint(x: 0.5, y: 0.5)) {
+        if zoom != nil {
+            exitZoom()
+            return
+        }
+        guard let photo = activePhoto, !isCropping else { return }
+        viewMode = .loupe
+        zoom = ZoomState(photoID: photo.id, focus: focus, anchor: anchor)
+        zoomFullSize = nil
+        detail = nil
+        detailViewport = nil
+        requestDetail()
+    }
+
+    func exitZoom(refreshPreview: Bool = true) {
+        guard zoom != nil else { return }
+        zoom = nil
+        zoomFullSize = nil
+        detail = nil
+        detailViewport = nil
+        if refreshPreview, previewStaleWhileZoomed {
+            previewStaleWhileZoomed = false
+            requestPreview(forThumbnail: true)
+        }
+    }
+
+    /// Called as the zoomed view scrolls; `rect` is the visible area in full-resolution pixels.
+    func setZoomViewport(_ rect: CGRect) {
+        guard zoom != nil, let fullSize = zoomFullSize else { return }
+        zoomCenter = CGPoint(
+            x: min(max(rect.midX / fullSize.width, 0), 1),
+            y: min(max(rect.midY / fullSize.height, 0), 1)
+        )
+        // Render a margin around the visible area so small pans don't reveal the soft base.
+        let margin = rect.insetBy(dx: -rect.width * 0.25, dy: -rect.height * 0.25)
+        let viewport = margin.integral.intersection(CGRect(origin: .zero, size: fullSize))
+        if let detail, detail.photoID == activeID, detail.rect.contains(rect), detailViewport != nil {
+            detailViewport = viewport
+            return  // Visible area is already covered.
+        }
+        detailViewport = viewport
+        requestDetail()
+    }
+
+    /// Renders the visible area at full resolution. Requests made while a render is running are coalesced.
+    private func requestDetail() {
+        detailPending = true
+        guard detailTask == nil else { return }
+        detailTask = Task {
+            while detailPending {
+                detailPending = false
+                guard let zoom, let photo = activePhoto, photo.id == zoom.photoID else { break }
+                let original = showOriginal
+                let result = await renderer.renderDetail(
+                    url: photo.url,
+                    settings: original ? EditSettings.default : photo.settings,
+                    geometry: !original,
+                    rect: detailViewport
+                )
+                guard self.zoom?.photoID == photo.id, let result else { continue }
+                zoomFullSize = result.fullSize
+                if let image = result.image {
+                    detail = DetailImage(photoID: photo.id, image: image, rect: result.rect)
+                }
+            }
+            detailTask = nil
         }
     }
 

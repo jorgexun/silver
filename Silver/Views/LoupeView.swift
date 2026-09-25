@@ -35,20 +35,13 @@ private struct PreviewCanvas: View {
 
     var body: some View {
         let preview = library.preview?.photoID == photo.id ? library.preview : nil
-        ZStack {
-            if let image = preview?.image ?? photo.thumbnail {
-                Image(decorative: image, scale: 1)
-                    .resizable()
-                    .interpolation(.high)
-                    .aspectRatio(contentMode: .fit)
-                    .shadow(color: .black.opacity(0.4), radius: 8)
-                    .padding(28)
-            }
-            if preview == nil {
-                ProgressView()
-                    .controlSize(.small)
-                    .padding(8)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 6))
+        let image = preview?.image ?? photo.thumbnail
+        Group {
+            if let zoom = library.zoom, zoom.photoID == photo.id {
+                ZoomedCanvas(zoom: zoom, base: image)
+                    .id(zoom.photoID)  // Fresh scroll state for each photo.
+            } else {
+                fitCanvas(image: image, isLoading: preview == nil)
             }
         }
         .overlay(alignment: .top) {
@@ -62,6 +55,146 @@ private struct PreviewCanvas: View {
             }
         }
     }
+
+    private func fitCanvas(image: CGImage?, isLoading: Bool) -> some View {
+        GeometryReader { geometry in
+            let padding: CGFloat = 28
+            let frame = image.map { fitRect(CGSize(width: $0.width, height: $0.height), in: geometry.size, padding: padding) }
+            ZStack {
+                if let image {
+                    Image(decorative: image, scale: 1)
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                        .shadow(color: .black.opacity(0.4), radius: 8)
+                        .padding(padding)
+                }
+                if isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                        .padding(8)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 6))
+                }
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+            .contentShape(Rectangle())
+            .onTapGesture(coordinateSpace: .local) { location in
+                guard let frame, frame.width > 0, frame.height > 0 else { return }
+                let focus = CGPoint(
+                    x: min(max((location.x - frame.minX) / frame.width, 0), 1),
+                    y: min(max((location.y - frame.minY) / frame.height, 0), 1)
+                )
+                let anchor = CGPoint(x: location.x / geometry.size.width, y: location.y / geometry.size.height)
+                library.toggleZoom(focus: focus, anchor: anchor)
+            }
+            .pointerStyle(image == nil ? .default : .zoomIn)
+        }
+    }
+}
+
+/// The photo at 100%: one image pixel per screen pixel. The fit preview, enlarged, fills in
+/// until the visible area has been rendered at full resolution on top of it.
+private struct ZoomedCanvas: View {
+    @Environment(LibraryModel.self) private var library
+    @Environment(\.displayScale) private var displayScale
+    let zoom: ZoomState
+    let base: CGImage?
+
+    @State private var position = ScrollPosition()
+    @State private var visibleRect: CGRect = .zero
+    @State private var dragStart: CGPoint?
+    @State private var didScrollToFocus = false
+
+    var body: some View {
+        GeometryReader { geometry in
+            if let fullSize = library.zoomFullSize {
+                let content = CGSize(width: fullSize.width / displayScale, height: fullSize.height / displayScale)
+                // Center images smaller than the window.
+                let inset = CGSize(
+                    width: max((geometry.size.width - content.width) / 2, 0),
+                    height: max((geometry.size.height - content.height) / 2, 0)
+                )
+                ScrollView([.horizontal, .vertical]) {
+                    ZStack(alignment: .topLeading) {
+                        if let base {
+                            Image(decorative: base, scale: 1)
+                                .resizable()
+                                .interpolation(.high)
+                                .frame(width: content.width, height: content.height)
+                        }
+                        if let detail = library.detail, detail.photoID == zoom.photoID {
+                            Image(decorative: detail.image, scale: displayScale)
+                                .interpolation(.none)
+                                .offset(x: detail.rect.minX / displayScale, y: detail.rect.minY / displayScale)
+                        }
+                    }
+                    .frame(width: content.width, height: content.height, alignment: .topLeading)
+                    .clipped()
+                    .padding(.horizontal, inset.width)
+                    .padding(.vertical, inset.height)
+                    .contentShape(Rectangle())
+                    .onTapGesture { library.exitZoom() }
+                    .gesture(
+                        // Global coordinates: the content moves while it scrolls, so local
+                        // translations would feed back into the scroll position.
+                        DragGesture(minimumDistance: 3, coordinateSpace: .global)
+                            .onChanged { value in
+                                let start = dragStart ?? visibleRect.origin
+                                dragStart = start
+                                position.scrollTo(point: CGPoint(x: start.x - value.translation.width, y: start.y - value.translation.height))
+                            }
+                            .onEnded { _ in dragStart = nil }
+                    )
+                    .pointerStyle(dragStart == nil ? .grabIdle : .grabActive)
+                }
+                .scrollIndicators(.automatic)
+                .scrollPosition($position)
+                .onScrollGeometryChange(for: CGRect.self, of: { $0.visibleRect }) { _, rect in
+                    visibleRect = rect
+                    let visible = CGRect(
+                        x: (rect.minX - inset.width) * displayScale,
+                        y: (rect.minY - inset.height) * displayScale,
+                        width: rect.width * displayScale,
+                        height: rect.height * displayScale
+                    )
+                    library.setZoomViewport(visible)
+                }
+                .onAppear {
+                    guard !didScrollToFocus else { return }
+                    didScrollToFocus = true
+                    // Keep the clicked point under the cursor.
+                    position.scrollTo(point: CGPoint(
+                        x: zoom.focus.x * content.width + inset.width - zoom.anchor.x * geometry.size.width,
+                        y: zoom.focus.y * content.height + inset.height - zoom.anchor.y * geometry.size.height
+                    ))
+                }
+            } else {
+                ZStack {
+                    if let base {
+                        Image(decorative: base, scale: 1)
+                            .resizable()
+                            .interpolation(.high)
+                            .aspectRatio(contentMode: .fit)
+                            .padding(28)
+                    }
+                    ProgressView().controlSize(.small)
+                }
+                .frame(width: geometry.size.width, height: geometry.size.height)
+            }
+        }
+    }
+}
+
+private func fitRect(_ size: CGSize, in container: CGSize, padding: CGFloat) -> CGRect {
+    let available = CGSize(width: max(container.width - padding * 2, 1), height: max(container.height - padding * 2, 1))
+    let scale = min(available.width / size.width, available.height / size.height)
+    let fitted = CGSize(width: size.width * scale, height: size.height * scale)
+    return CGRect(
+        x: (container.width - fitted.width) / 2,
+        y: (container.height - fitted.height) / 2,
+        width: fitted.width,
+        height: fitted.height
+    )
 }
 
 // MARK: - Crop editor
@@ -247,17 +380,5 @@ struct CropEditorView: View {
             if handle.movesTop { minY = maxY - height } else { maxY = minY + height }
         }
         return CropRect(minX: minX, minY: minY, maxX: maxX, maxY: maxY)
-    }
-
-    private func fitRect(_ size: CGSize, in container: CGSize, padding: CGFloat) -> CGRect {
-        let available = CGSize(width: max(container.width - padding * 2, 1), height: max(container.height - padding * 2, 1))
-        let scale = min(available.width / size.width, available.height / size.height)
-        let fitted = CGSize(width: size.width * scale, height: size.height * scale)
-        return CGRect(
-            x: (container.width - fitted.width) / 2,
-            y: (container.height - fitted.height) / 2,
-            width: fitted.width,
-            height: fitted.height
-        )
     }
 }

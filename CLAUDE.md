@@ -64,6 +64,8 @@ JPEG sources use `CITemperatureAndTint` for white balance and the same kernel wi
 
 `research.md` surveys how Adobe, Apple, darktable and RawTherapee design these curves, with measurements.
 
+**100% zoom.** Clicking the loupe image or pressing Z toggles `LibraryModel.zoom`. Switching photos while zoomed stays at 100% at the same relative position (`zoomCenter`), for comparing focus across a burst. The zoomed view is a `ScrollView` sized to the full-resolution output. The fit preview is stretched underneath as a placeholder, and on top `PreviewRenderer.renderDetail` renders only the visible area (plus a margin) at full resolution. While zoomed, edits re-render just that area; the fit preview is refreshed on exit. Rendering both sizes at once would flip the shared RAW decoder's scale back and forth.
+
 **Thumbnails and export.**
 - Thumbnails show the file's embedded preview first. Edited photos are re-rendered through the pipeline one at a time, because full RAW decodes don't parallelize and are memory heavy.
 - Export runs jobs sequentially in `Task.detached`. It writes sRGB JPEGs with a whitelisted subset of the original EXIF/GPS/TIFF metadata and orientation 1.

@@ -119,6 +119,9 @@ struct SilverCommands: Commands {
             Button("Loupe") { library.viewMode = .loupe }
                 .keyboardShortcut("e", modifiers: [])
                 .disabled(library.activePhoto == nil || library.isShowingSheet)
+            Button(library.zoom == nil ? "Zoom to 100%" : "Zoom to Fit") { library.toggleZoom() }
+                .keyboardShortcut("z", modifiers: [])
+                .disabled(library.activePhoto == nil || library.isCropping || library.isShowingSheet)
             Button(library.isInspectorPresented ? "Hide Adjustments" : "Show Adjustments") {
                 library.isInspectorPresented.toggle()
             }

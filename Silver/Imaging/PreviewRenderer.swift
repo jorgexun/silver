@@ -9,6 +9,15 @@ nonisolated struct PreviewResult: @unchecked Sendable {
     let thumbnail: CGImage?
 }
 
+nonisolated struct DetailResult: @unchecked Sendable {
+    /// Full-resolution pixels for `rect`, or nil when only the size was requested.
+    let image: CGImage?
+    /// Rendered area in full-resolution output pixels, top-left origin.
+    let rect: CGRect
+    /// Size of the full-resolution output (after crop and straighten).
+    let fullSize: CGSize
+}
+
 /// Renders screen-sized previews. Keeps a few decoded sources around so revisiting
 /// recent photos and dragging sliders stays fast.
 actor PreviewRenderer {
@@ -32,6 +41,25 @@ actor PreviewRenderer {
             thumbnail = Thumbnails.downscale(image, maxPixelSize: Thumbnails.maxPixelSize, context: context)
         }
         return PreviewResult(image: cgImage, baseSize: baseSize, thumbnail: thumbnail)
+    }
+
+    /// Renders part of the photo at full resolution, for viewing at 100%. `rect` is in
+    /// full-resolution output pixels with a top-left origin and is clipped to the image; pass
+    /// nil to only get the full-resolution size.
+    func renderDetail(url: URL, settings: EditSettings, geometry: Bool, rect: CGRect?) -> DetailResult? {
+        guard let source = source(for: url, maxPixelSize: .infinity) else { return nil }
+        source.ensureLongEdge(.infinity)
+        guard let (image, _) = ImagePipeline.render(source, settings: settings, geometry: geometry) else { return nil }
+        let extent = image.extent
+        let fullSize = extent.size
+        guard let rect else { return DetailResult(image: nil, rect: .zero, fullSize: fullSize) }
+
+        let clipped = rect.integral.intersection(CGRect(origin: .zero, size: fullSize))
+        guard !clipped.isEmpty else { return nil }
+        // Top-left origin → Core Image's bottom-left origin.
+        let region = CGRect(x: extent.minX + clipped.minX, y: extent.maxY - clipped.maxY, width: clipped.width, height: clipped.height)
+        let cgImage = context.createCGImage(image, from: region, format: .RGBA8, colorSpace: ImagePipeline.sRGB)
+        return DetailResult(image: cgImage, rect: clipped, fullSize: fullSize)
     }
 
     func removeAll() {
