@@ -31,6 +31,7 @@ The harness file must be named `main.swift` for top-level code (don't pass `-par
 
 - The target uses file-system-synchronized groups: any file under `Silver/` is compiled automatically, with no `project.pbxproj` edit needed.
 - Swift 5 language mode with `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` and approachable concurrency. Everything is main-actor unless marked `nonisolated`, and `nonisolated async` functions run on the caller's actor. Heavy work therefore goes through `Task.detached` or the `PreviewRenderer` actor, and value types used off the main actor are declared `nonisolated`.
+- Loupe cursors use the `cursor(_:)` modifier in `LoupeView.swift`, not `pointerStyle` alone. `pointerStyle` misses state changes under a still pointer, changes during a drag, and exits into the sidebar and toolbar, which set no cursor of their own.
 - App Sandbox: user-selected files are read-write (needed for sidecars and export). `Silver.entitlements` adds app-scoped security bookmarks and is merged with the build-setting entitlements.
 
 ## Architecture

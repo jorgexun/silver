@@ -33,17 +33,23 @@ private struct PreviewCanvas: View {
     @Environment(LibraryModel.self) private var library
     let photo: Photo
 
+    /// Scroll position where a pan of the zoomed view started; nil when not panning.
+    @State private var panStart: CGPoint?
+
     var body: some View {
         let preview = library.preview?.photoID == photo.id ? library.preview : nil
         let image = preview?.image ?? photo.thumbnail
+        let isZoomed = library.zoom?.photoID == photo.id
         Group {
-            if let zoom = library.zoom, zoom.photoID == photo.id {
-                ZoomedCanvas(zoom: zoom, base: image)
+            if let zoom = library.zoom, isZoomed {
+                ZoomedCanvas(zoom: zoom, base: image, dragStart: $panStart)
                     .id(zoom.photoID)  // Fresh scroll state for each photo.
             } else {
                 fitCanvas(image: image, isLoading: preview == nil)
             }
         }
+        // On the container, so the cursor follows a click that zooms in or out.
+        .cursor(cursor(isZoomed: isZoomed, hasImage: image != nil))
         .overlay(alignment: .top) {
             if library.showOriginal {
                 Text("Original")
@@ -54,6 +60,11 @@ private struct PreviewCanvas: View {
                     .padding(.top, 10)
             }
         }
+    }
+
+    private func cursor(isZoomed: Bool, hasImage: Bool) -> CanvasCursor {
+        if isZoomed { return panStart == nil ? .openHand : .closedHand }
+        return hasImage ? .zoomIn : .arrow
     }
 
     private func fitCanvas(image: CGImage?, isLoading: Bool) -> some View {
@@ -87,7 +98,6 @@ private struct PreviewCanvas: View {
                 let anchor = CGPoint(x: location.x / geometry.size.width, y: location.y / geometry.size.height)
                 library.toggleZoom(focus: focus, anchor: anchor)
             }
-            .pointerStyle(image == nil ? .default : .zoomIn)
         }
     }
 }
@@ -99,10 +109,10 @@ private struct ZoomedCanvas: View {
     @Environment(\.displayScale) private var displayScale
     let zoom: ZoomState
     let base: CGImage?
+    @Binding var dragStart: CGPoint?
 
     @State private var position = ScrollPosition()
     @State private var scroll = ScrollTracker()
-    @State private var dragStart: CGPoint?
     @State private var didScrollToFocus = false
 
     var body: some View {
@@ -145,7 +155,6 @@ private struct ZoomedCanvas: View {
                             }
                             .onEnded { _ in dragStart = nil }
                     )
-                    .pointerStyle(dragStart == nil ? .grabIdle : .grabActive)
                 }
                 .scrollIndicators(.automatic)
                 .scrollPosition($position)
@@ -202,6 +211,75 @@ private final class ScrollTracker {
     var origin: CGPoint = .zero
 }
 
+private enum CanvasCursor: Equatable {
+    case arrow, zoomIn, openHand, closedHand
+    case resize(FrameResizePosition)
+
+    var style: PointerStyle {
+        switch self {
+        case .arrow: .default
+        case .zoomIn: .zoomIn
+        case .openHand: .grabIdle
+        case .closedHand: .grabActive
+        case .resize(let position): .frameResize(position: position)
+        }
+    }
+
+    var nsCursor: NSCursor {
+        switch self {
+        case .arrow: .arrow
+        case .zoomIn: .zoomIn
+        case .openHand: .openHand
+        case .closedHand: .closedHand
+        case .resize(let position): .frameResize(position: Self.appKitPosition(position), directions: .all)
+        }
+    }
+
+    private static func appKitPosition(_ position: FrameResizePosition) -> NSCursor.FrameResizePosition {
+        switch position {
+        case .top: .top
+        case .leading: .left
+        case .bottom: .bottom
+        case .trailing: .right
+        case .topLeading: .topLeft
+        case .topTrailing: .topRight
+        case .bottomLeading: .bottomLeft
+        case .bottomTrailing: .bottomRight
+        }
+    }
+}
+
+extension View {
+    /// Shows `cursor` over this view. `pointerStyle` alone misses drags, state changes and exits
+    /// (see CLAUDE.md), so the cursor is also set directly and reset to the arrow on exit.
+    fileprivate func cursor(_ cursor: CanvasCursor) -> some View {
+        modifier(CursorModifier(cursor: cursor))
+    }
+}
+
+private struct CursorModifier: ViewModifier {
+    let cursor: CanvasCursor
+    @State private var isHovering = false
+
+    func body(content: Content) -> some View {
+        content
+            .pointerStyle(cursor.style)
+            .onContinuousHover { phase in
+                switch phase {
+                case .active:
+                    isHovering = true
+                    cursor.nsCursor.set()
+                case .ended:
+                    isHovering = false
+                    NSCursor.arrow.set()
+                }
+            }
+            .onChange(of: cursor) {
+                if isHovering { cursor.nsCursor.set() }
+            }
+    }
+}
+
 private func fitRect(_ size: CGSize, in container: CGSize, padding: CGFloat) -> CGRect {
     let available = CGSize(width: max(container.width - padding * 2, 1), height: max(container.height - padding * 2, 1))
     let scale = min(available.width / size.width, available.height / size.height)
@@ -231,10 +309,54 @@ private enum CropHandle: CaseIterable, Hashable {
     var movesTop: Bool { [.topLeft, .top, .topRight].contains(self) }
     var movesBottom: Bool { [.bottomLeft, .bottom, .bottomRight].contains(self) }
 
+    var resizePosition: FrameResizePosition {
+        switch self {
+        case .topLeft: .topLeading
+        case .top: .top
+        case .topRight: .topTrailing
+        case .right: .trailing
+        case .bottomRight: .bottomTrailing
+        case .bottom: .bottom
+        case .bottomLeft: .bottomLeading
+        case .left: .leading
+        }
+    }
+
     func point(in rect: CGRect) -> CGPoint {
         let x = movesLeft ? rect.minX : movesRight ? rect.maxX : rect.midX
         let y = movesTop ? rect.minY : movesBottom ? rect.maxY : rect.midY
         return CGPoint(x: x, y: y)
+    }
+}
+
+/// What a pointer grabs in the crop editor.
+private enum CropTarget: Equatable {
+    case move
+    case resize(CropHandle)
+
+    /// Corners and edges within a few points of the crop outline, then the inside of the crop;
+    /// nil outside it.
+    init?(at point: CGPoint, in frame: CGRect) {
+        let cornerReach: CGFloat = 12
+        let edgeReach: CGFloat = 8
+        // For a narrow crop, the nearer side wins.
+        let left = abs(point.x - frame.minX), right = abs(point.x - frame.maxX)
+        let top = abs(point.y - frame.minY), bottom = abs(point.y - frame.maxY)
+        let nearLeft = left <= right
+        let nearTop = top <= bottom
+        let dx = min(left, right), dy = min(top, bottom)
+
+        if dx <= cornerReach, dy <= cornerReach {
+            self = .resize(nearTop ? (nearLeft ? .topLeft : .topRight) : (nearLeft ? .bottomLeft : .bottomRight))
+        } else if dx <= edgeReach, point.y > frame.minY, point.y < frame.maxY {
+            self = .resize(nearLeft ? .left : .right)
+        } else if dy <= edgeReach, point.x > frame.minX, point.x < frame.maxX {
+            self = .resize(nearTop ? .top : .bottom)
+        } else if frame.contains(point) {
+            self = .move
+        } else {
+            return nil
+        }
     }
 }
 
@@ -243,8 +365,10 @@ struct CropEditorView: View {
     let photo: Photo
     let image: CGImage?
 
-    @State private var dragStart: CropRect?
-    @State private var isDragging = false
+    /// What the current drag grabbed and the crop when it started; drags starting outside the
+    /// crop do nothing.
+    @State private var drag: (target: CropTarget, start: CropRect)?
+    @State private var hover: CropTarget?
 
     var body: some View {
         GeometryReader { geometry in
@@ -265,8 +389,6 @@ struct CropEditorView: View {
             width: crop.width * box.width,
             height: crop.height * box.height
         )
-        let locked = settings.aspectRatio != .free
-
         ZStack(alignment: .topLeading) {
             Group {
                 if let image {
@@ -291,7 +413,7 @@ struct CropEditorView: View {
             .allowsHitTesting(false)
 
             thirdsGrid(in: cropFrame)
-                .stroke(Color.white.opacity(isDragging ? 0.55 : 0.25), lineWidth: 0.5)
+                .stroke(Color.white.opacity(drag != nil ? 0.55 : 0.25), lineWidth: 0.5)
                 .allowsHitTesting(false)
 
             Rectangle()
@@ -299,39 +421,48 @@ struct CropEditorView: View {
                 .stroke(Color.white.opacity(0.9), lineWidth: 1)
                 .allowsHitTesting(false)
 
-            // Drag inside the crop to move it.
-            Rectangle()
-                .fill(Color.clear)
-                .contentShape(Rectangle())
-                .frame(width: max(cropFrame.width - 24, 1), height: max(cropFrame.height - 24, 1))
-                .position(x: cropFrame.midX, y: cropFrame.midY)
-                .gesture(dragGesture(handle: nil, box: box, imageSize: imageSize))
-                .pointerStyle(isDragging ? .grabActive : .grabIdle)
-
-            ForEach(CropHandle.allCases.filter { $0.isCorner || !locked }, id: \.self) { handle in
+            ForEach(CropHandle.allCases, id: \.self) { handle in
                 handleView(handle)
                     .position(handle.point(in: cropFrame))
-                    .gesture(dragGesture(handle: handle, box: box, imageSize: imageSize))
+                    .allowsHitTesting(false)
             }
         }
         .frame(width: viewSize.width, height: viewSize.height)
+        .contentShape(Rectangle())
+        .onContinuousHover { phase in
+            if case .active(let point) = phase {
+                hover = CropTarget(at: point, in: cropFrame)
+            } else {
+                hover = nil
+            }
+        }
+        .gesture(dragGesture(cropFrame: cropFrame, box: box, imageSize: imageSize))
+        .cursor(cursor)
+    }
+
+    /// A drag keeps the cursor of what it grabbed, even when the pointer moves off it.
+    private var cursor: CanvasCursor {
+        let target = drag?.target ?? hover
+        switch target {
+        case .move: return drag == nil ? .openHand : .closedHand
+        case .resize(let handle): return .resize(handle.resizePosition)
+        case nil: return .arrow
+        }
     }
 
     private func handleView(_ handle: CropHandle) -> some View {
-        ZStack {
-            Color.clear.frame(width: 26, height: 26).contentShape(Rectangle())
+        Group {
             if handle.isCorner {
                 RoundedRectangle(cornerRadius: 2)
                     .fill(Color.white)
                     .frame(width: 11, height: 11)
-                    .shadow(color: .black.opacity(0.5), radius: 1)
             } else {
                 Capsule()
                     .fill(Color.white)
                     .frame(width: [.top, .bottom].contains(handle) ? 22 : 5, height: [.top, .bottom].contains(handle) ? 5 : 22)
-                    .shadow(color: .black.opacity(0.5), radius: 1)
             }
         }
+        .shadow(color: .black.opacity(0.5), radius: 1)
     }
 
     private func thirdsGrid(in rect: CGRect) -> Path {
@@ -347,31 +478,31 @@ struct CropEditorView: View {
         }
     }
 
-    private func dragGesture(handle: CropHandle?, box: CGRect, imageSize: CGSize) -> some Gesture {
+    private func dragGesture(cropFrame: CGRect, box: CGRect, imageSize: CGSize) -> some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
                 let settings = photo.settings
-                let start = dragStart ?? settings.crop
-                if dragStart == nil {
-                    dragStart = start
-                    isDragging = true
+                if drag == nil, let target = CropTarget(at: value.startLocation, in: cropFrame) {
+                    drag = (target, settings.crop)
                 }
+                guard let drag else { return }
+                let start = drag.start
                 let dx = value.translation.width / box.width
                 let dy = value.translation.height / box.height
                 let normalizedAspect = CropGeometry.pixelAspect(for: settings.aspectRatio, matching: start, imageSize: imageSize)
                     .map { $0 / Double(imageSize.width / imageSize.height) }
-                let proposal = proposedRect(from: start, handle: handle, dx: dx, dy: dy, aspect: normalizedAspect)
+                let proposal = proposedRect(from: start, target: drag.target, dx: dx, dy: dy, aspect: normalizedAspect)
                 let rect = CropGeometry.constrained(from: settings.crop, to: proposal, angle: settings.straighten, imageSize: imageSize)
                 library.setCrop(rect)
             }
-            .onEnded { _ in
-                dragStart = nil
-                isDragging = false
+            .onEnded { value in
+                drag = nil
+                hover = CropTarget(at: value.location, in: cropFrame)
             }
     }
 
-    private func proposedRect(from start: CropRect, handle: CropHandle?, dx: Double, dy: Double, aspect: Double?) -> CropRect {
-        guard let handle else {
+    private func proposedRect(from start: CropRect, target: CropTarget, dx: Double, dy: Double, aspect: Double?) -> CropRect {
+        guard case .resize(let handle) = target else {
             let x = min(max(start.x + dx, 0), 1 - start.width)
             let y = min(max(start.y + dy, 0), 1 - start.height)
             return CropRect(x: x, y: y, width: start.width, height: start.height)
@@ -384,10 +515,17 @@ struct CropEditorView: View {
         if handle.movesTop { minY = min(max(start.minY + dy, 0), maxY - minSize) }
         if handle.movesBottom { maxY = max(min(start.maxY + dy, 1), minY + minSize) }
 
-        if let aspect, handle.isCorner {
-            // Grow the shorter side to match the ratio, anchored at the opposite corner.
+        if let aspect {
             var width = maxX - minX
             var height = maxY - minY
+            // An edge keeps the ratio by resizing the other axis about the crop's center.
+            if handle == .left || handle == .right {
+                return CropRect(centerX: (minX + maxX) / 2, centerY: start.midY, width: width, height: width / aspect)
+            }
+            if handle == .top || handle == .bottom {
+                return CropRect(centerX: start.midX, centerY: (minY + maxY) / 2, width: height * aspect, height: height)
+            }
+            // A corner grows the shorter side to match, anchored at the opposite corner.
             if width / height > aspect {
                 height = width / aspect
             } else {
