@@ -1,5 +1,6 @@
 import CoreImage
 import Foundation
+import Synchronization
 
 /// Maps scene-linear values (which may exceed 1 after exposure) to display range with a soft
 /// highlight shoulder, instead of clipping each channel at 1.
@@ -14,7 +15,7 @@ nonisolated enum ToneMapping {
     private static let encodePower = 0.25
     private static let samples = 1024
 
-    private struct Curve {
+    private struct Curve: Sendable {
         let ratio: Data
         let white: Data
         let mask: Data
@@ -23,13 +24,45 @@ nonisolated enum ToneMapping {
     /// Curve for RAW files: follows Core Image's default RAW tone curve (measured from its
     /// output on Leica M11 files) through shadows and midtones, so the default look is unchanged,
     /// then continues into a long shoulder where the default curve would clip at 1.
-    private static let raw = makeCurve(knee: 0.46) { x in
-        let knee = 0.46
-        guard x > knee else { return interpolate(appleCurve, at: x) }
-        let kneeValue = interpolate(appleCurve, at: knee)
+    private static let raw = makeCurve(knee: rawKnee, rawTone)
+    private static let rawKnee = 0.46
+
+    private static func rawTone(_ x: Double) -> Double {
+        guard x > rawKnee else { return interpolate(appleCurve, at: x) }
+        let kneeValue = interpolate(appleCurve, at: rawKnee)
         let slope = 0.86
-        let t = slope * (x - knee) / (1 - kneeValue)
+        let t = slope * (x - rawKnee) / (1 - kneeValue)
         return kneeValue + (1 - kneeValue) * t / (1 + t)
+    }
+
+    /// RAW curves with a Highlights adjustment, keyed by slider value.
+    private static let highlightCurves = Mutex<[Int: Curve]>([:])
+
+    private static func rawCurve(highlights: Double) -> Curve {
+        let key = Int(highlights.rounded())
+        guard key != 0 else { return raw }
+        if let cached = highlightCurves.withLock({ $0[key] }) { return cached }
+        // Negative values pull highlights down (recovery); positive values push them up.
+        let amount = key < 0 ? Double(-key) / 100 * 0.75 : -Double(key) / 100 * 0.5
+        let curve = makeCurve(knee: rawKnee) { rawTone(shiftHighlights($0, amount: amount)) }
+        highlightCurves.withLock { cache in
+            if cache.count >= 64 { cache.removeAll() }
+            cache[key] = curve
+        }
+        return curve
+    }
+
+    /// Scales the distance above an upper-midtone pivot, measured in stops, by `1 - amount`.
+    /// Works on scene-linear values before the shoulder, so highlight detail that the curve
+    /// would squeeze into the last few output levels gets spread back out. The transition
+    /// around the pivot is gradual, leaving midtones and shadows unchanged.
+    private static func shiftHighlights(_ x: Double, amount: Double) -> Double {
+        guard x > 0 else { return x }
+        let pivot = 0.25
+        let softness = 2.0
+        let stops = log2(x / pivot)
+        let aboveStops = log1p(exp(softness * stops)) / softness  // ≈ 0 below the pivot, ≈ stops above
+        return x * pow(2, -amount * aboveStops)
     }
 
     /// (scene-linear input, output) pairs of Core Image's default RAW rendering (`boostAmount` 1).
@@ -54,7 +87,7 @@ nonisolated enum ToneMapping {
         return x <= knee ? x : knee + (1 - knee) * (1 - exp(-(x - knee) / (1 - knee)))
     }
 
-    static func raw(_ image: CIImage) -> CIImage { apply(raw, to: image) }
+    static func raw(_ image: CIImage, highlights: Double) -> CIImage { apply(rawCurve(highlights: highlights), to: image) }
     static func shoulder(_ image: CIImage) -> CIImage { apply(shoulder, to: image) }
 
     private static func apply(_ curve: Curve, to image: CIImage) -> CIImage {

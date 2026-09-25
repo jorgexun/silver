@@ -113,7 +113,7 @@ nonisolated final class SourceImage {
             if settings.exposure != 0 {
                 image = image.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: settings.exposure])
             }
-            image = ToneMapping.raw(image)
+            image = ToneMapping.raw(image, highlights: settings.highlights)
         } else {
             guard let bitmap = loadBitmap() else { return nil }
             image = bitmap
@@ -132,7 +132,7 @@ nonisolated final class SourceImage {
                 image = ToneMapping.shoulder(image)
             }
         }
-        return ImagePipeline.applyTone(settings, to: image)
+        return ImagePipeline.applyTone(settings, to: image, highlightsApplied: rawFilter != nil)
     }
 }
 
@@ -140,22 +140,24 @@ nonisolated enum ImagePipeline {
     static let sRGB = CGColorSpace(name: CGColorSpace.sRGB)!
 
     /// Contrast, highlights, shadows, vibrance and saturation.
-    static func applyTone(_ settings: EditSettings, to input: CIImage) -> CIImage {
+    /// `highlightsApplied`: Highlights was already applied by RAW tone mapping.
+    static func applyTone(_ settings: EditSettings, to input: CIImage, highlightsApplied: Bool = false) -> CIImage {
         var image = input
+        let highlights = highlightsApplied ? 0 : settings.highlights
 
-        if settings.highlights < 0 || settings.shadows != 0 {
+        if highlights < 0 || settings.shadows != 0 {
             let filter = CIFilter.highlightShadowAdjust()
             filter.inputImage = image
             filter.radius = 0  // Scale independent, so previews match full-size exports.
-            filter.highlightAmount = Float(1 + min(settings.highlights, 0) / 100 * 0.7)
+            filter.highlightAmount = Float(1 + min(highlights, 0) / 100 * 0.7)
             filter.shadowAmount = Float(settings.shadows / 100 * 0.6)
             image = filter.outputImage ?? image
         }
 
-        if settings.contrast != 0 || settings.highlights > 0 {
+        if settings.contrast != 0 || highlights > 0 {
             // Tone curve in a perceptual (sRGB gamma) space.
             let c = settings.contrast / 100
-            let h = max(settings.highlights, 0) / 100
+            let h = max(highlights, 0) / 100
             let curve = CIFilter.toneCurve()
             curve.inputImage = image.applyingFilter("CILinearToSRGBToneCurve")
             curve.point0 = CGPoint(x: 0, y: 0)
