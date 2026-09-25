@@ -26,6 +26,9 @@ nonisolated final class SourceImage {
             if let maxPixelSize, longEdge > maxPixelSize {
                 raw.scaleFactor = Float(maxPixelSize / longEdge)
             }
+            // Scene-linear output with highlight headroom; tone mapping happens in ToneMapping.
+            raw.boostAmount = 0
+            raw.extendedDynamicRangeAmount = 2
             rawFilter = raw
             bitmap = nil
             asShotTemperature = raw.neutralTemperature
@@ -57,14 +60,19 @@ nonisolated final class SourceImage {
     func developed(with settings: EditSettings) -> CIImage? {
         var image: CIImage
         if let raw = rawFilter {
-            raw.exposure = Float(settings.exposure)
             // Temperature is adjusted in mired space so the slider feels even across the range.
             let asShotMired = 1_000_000 / Double(max(asShotTemperature, 1000))
             let mired = max(asShotMired - settings.temperature * 0.8, 20)
             raw.neutralTemperature = Float(1_000_000 / mired)
             raw.neutralTint = asShotTint + Float(settings.tint)
             guard let output = raw.outputImage else { return nil }
+            // Exposure as a linear gain: unlike the RAW filter's own exposure it is not capped,
+            // so the tone curve can roll bright areas off instead of clipping them.
             image = output
+            if settings.exposure != 0 {
+                image = image.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: settings.exposure])
+            }
+            image = ToneMapping.raw(image)
         } else {
             guard let bitmap else { return nil }
             image = bitmap
@@ -78,6 +86,9 @@ nonisolated final class SourceImage {
                 filter.neutral = CIVector(x: 6500, y: 0)
                 filter.targetNeutral = CIVector(x: 1_000_000 / max(targetMired, 20), y: -settings.tint)
                 image = filter.outputImage ?? image
+            }
+            if settings.exposure > 0 {
+                image = ToneMapping.shoulder(image)
             }
         }
         return ImagePipeline.applyTone(settings, to: image)
