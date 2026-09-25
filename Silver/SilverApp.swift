@@ -4,7 +4,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let library = LibraryModel()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        library.restoreLastFolder()
+        library.restoreSession()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -24,7 +24,7 @@ struct SilverApp: App {
         Window("Silver", id: "main") {
             ContentView()
                 .environment(appDelegate.library)
-                .frame(minWidth: 900, minHeight: 560)
+                .frame(minWidth: 1000, minHeight: 560)
                 .preferredColorScheme(.dark)
         }
         .defaultSize(width: 1400, height: 900)
@@ -40,9 +40,14 @@ struct SilverCommands: Commands {
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
-            Button("Open Folder…") { library.presentOpenPanel() }
+            Button("Add Folder…") { library.presentAddFolderPanel() }
                 .keyboardShortcut("o")
-            Button("Reload Folder") { library.reloadFolder() }
+            Button("Reload Folder") {
+                if let url = library.folderURL, let node = library.folders.rows.first(where: { $0.node.url == url })?.node {
+                    library.folders.refresh(node)
+                }
+                library.reloadFolder()
+            }
                 .keyboardShortcut("r", modifiers: [.command, .option])
                 .disabled(library.folderURL == nil)
         }

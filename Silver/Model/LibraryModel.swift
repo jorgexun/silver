@@ -13,7 +13,7 @@ struct PreviewImage {
     let hasGeometry: Bool
 }
 
-/// App state: the open folder, selection, editing, undo and background work.
+/// App state: sidebar folders, the open folder, selection, editing, undo and background work.
 @Observable
 final class LibraryModel {
     // MARK: Folder
@@ -92,6 +92,7 @@ final class LibraryModel {
     private var didReportSaveError = false
 
     let export = ExportModel()
+    let folders = SourceFolders()
 
     // MARK: - Derived state
 
@@ -115,50 +116,64 @@ final class LibraryModel {
 
     // MARK: - Opening folders
 
-    func presentOpenPanel() {
+    func presentAddFolderPanel() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Open"
-        panel.message = "Choose a folder containing DNG or JPEG photos."
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        openFolder(url)
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Add"
+        panel.message = "Choose folders to add to the sidebar."
+        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
+        addFolders(panel.urls)
     }
 
-    func restoreLastFolder() {
-        guard folderURL == nil, let url = Bookmarks.resolve(forKey: Bookmarks.libraryFolderKey) else { return }
-        openFolder(url, fromBookmark: true)
+    /// Adds folders to the sidebar and shows the first one.
+    func addFolders(_ urls: [URL]) {
+        let added = folders.add(urls)
+        if let first = added.first { openFolder(first) }
     }
+
+    func removeFolder(_ root: FolderNode) {
+        if let folderURL, SourceFolders.url(folderURL, isInside: root.url) {
+            closeFolder()
+        }
+        folders.remove(root)
+    }
+
+    /// Restores sidebar folders and the last selected folder.
+    func restoreSession() {
+        folders.restore()
+        if let path = UserDefaults.standard.string(forKey: Self.selectedFolderKey) {
+            let url = SourceFolders.normalized(URL(fileURLWithPath: path))
+            if folders.root(containing: url) != nil, FileManager.default.fileExists(atPath: url.path) {
+                openFolder(url)
+                folders.reveal(url)
+                return
+            }
+        }
+        if let first = folders.roots.first { openFolder(first.url) }
+    }
+
+    private static let selectedFolderKey = "SelectedFolderPath"
 
     func reloadFolder() {
         guard let folderURL else { return }
-        openFolder(folderURL, fromBookmark: false, keepAccess: true)
+        openFolder(folderURL, keepState: true)
     }
 
-    func openFolder(_ url: URL, fromBookmark: Bool = false, keepAccess: Bool = false) {
+    /// Shows the photos directly inside `url` (not in its subfolders).
+    func openFolder(_ url: URL, keepState: Bool = false) {
+        let url = SourceFolders.normalized(url)
+        guard keepState || url != folderURL else { return }
         endCrop()
         flushSaves()
-        if let previous = folderURL, !keepAccess {
-            previous.stopAccessingSecurityScopedResource()
-        }
-        if !fromBookmark, !keepAccess {
-            Bookmarks.save(url, forKey: Bookmarks.libraryFolderKey)
-        }
+        UserDefaults.standard.set(url.path, forKey: Self.selectedFolderKey)
 
-        let previousActiveID = keepAccess ? activeID : nil
+        let previousActiveID = keepState ? activeID : nil
+        resetFolderState()
         folderURL = url
         isScanning = true
-        photos = []
-        photosByID = [:]
-        selection = []
-        activeID = nil
-        anchorID = nil
-        preview = nil
-        undoStack = []
-        redoStack = []
-        thumbnailQueue = []
-        viewMode = keepAccess ? viewMode : .grid
+        viewMode = keepState ? viewMode : .grid
 
         Task {
             let entries = await Task.detached(priority: .userInitiated) { Self.scan(url) }.value
@@ -174,6 +189,27 @@ final class LibraryModel {
             // Embedded previews first; edited photos are re-queued for a rendered thumbnail.
             enqueueThumbnails(photos)
         }
+    }
+
+    private func closeFolder() {
+        endCrop()
+        flushSaves()
+        resetFolderState()
+        folderURL = nil
+        UserDefaults.standard.removeObject(forKey: Self.selectedFolderKey)
+    }
+
+    private func resetFolderState() {
+        isScanning = false
+        photos = []
+        photosByID = [:]
+        selection = []
+        activeID = nil
+        anchorID = nil
+        preview = nil
+        undoStack = []
+        redoStack = []
+        thumbnailQueue = []
     }
 
     nonisolated private struct ScanEntry: Sendable {

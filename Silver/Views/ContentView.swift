@@ -12,47 +12,57 @@ struct ContentView: View {
         @Bindable var library = library
         @Bindable var export = library.export
 
-        content
-            .inspector(isPresented: $library.isInspectorPresented) {
-                InspectorView()
-                    .inspectorColumnWidth(min: 260, ideal: 290, max: 380)
-            }
-            .toolbar { toolbar }
-            .navigationTitle(library.folderURL?.lastPathComponent ?? "Silver")
-            .navigationSubtitle(subtitle)
-            .sheet(isPresented: $export.isPresented) {
-                ExportSheet(model: library.export)
-            }
-            .sheet(isPresented: $library.isShowingCopyOptions) {
-                CopyOptionsSheet()
-            }
-            .alert(
-                "Something Went Wrong",
-                isPresented: Binding(get: { library.alertMessage != nil }, set: { if !$0 { library.alertMessage = nil } }),
-                presenting: library.alertMessage
-            ) { _ in
-                Button("OK") {}
-            } message: { message in
-                Text(message)
-            }
-            .dropDestination(for: URL.self) { urls, _ in
-                guard let folder = urls.first(where: \.hasDirectoryPath) else { return false }
-                library.openFolder(folder)
-                return true
-            }
+        NavigationSplitView {
+            SidebarView()
+                .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 360)
+        } detail: {
+            content
+                .inspector(isPresented: $library.isInspectorPresented) {
+                    InspectorView()
+                        .inspectorColumnWidth(min: 260, ideal: 290, max: 380)
+                }
+                .toolbar { toolbar }
+        }
+        .navigationTitle(library.folderURL?.lastPathComponent ?? "Silver")
+        .navigationSubtitle(subtitle)
+        .sheet(isPresented: $export.isPresented) {
+            ExportSheet(model: library.export)
+        }
+        .sheet(isPresented: $library.isShowingCopyOptions) {
+            CopyOptionsSheet()
+        }
+        .alert(
+            "Something Went Wrong",
+            isPresented: Binding(get: { library.alertMessage != nil }, set: { if !$0 { library.alertMessage = nil } }),
+            presenting: library.alertMessage
+        ) { _ in
+            Button("OK") {}
+        } message: { message in
+            Text(message)
+        }
+        .dropDestination(for: URL.self) { urls, _ in
+            let folders = urls.filter(\.hasDirectoryPath)
+            guard !folders.isEmpty else { return false }
+            library.addFolders(folders)
+            return true
+        }
     }
 
     @ViewBuilder
     private var content: some View {
-        if library.folderURL == nil {
+        if library.folders.roots.isEmpty {
             ContentUnavailableView {
-                Label("No Folder Open", systemImage: "folder")
+                Label("No Folders", systemImage: "folder")
             } description: {
-                Text("Open a folder of DNG or JPEG photos, or drop one here.")
+                Text("Add a folder of DNG or JPEG photos, or drop one here.")
             } actions: {
-                Button("Open Folder…") { library.presentOpenPanel() }
+                Button("Add Folder…") { library.presentAddFolderPanel() }
                     .buttonStyle(.borderedProminent)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.canvas)
+        } else if library.folderURL == nil {
+            ContentUnavailableView("Select a Folder", systemImage: "sidebar.leading", description: Text("Choose a folder in the sidebar."))
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color.canvas)
         } else if library.isScanning {
@@ -63,9 +73,7 @@ struct ContentView: View {
             ContentUnavailableView {
                 Label("No Photos", systemImage: "photo.on.rectangle")
             } description: {
-                Text("This folder doesn’t contain any DNG or JPEG files.")
-            } actions: {
-                Button("Open Another Folder…") { library.presentOpenPanel() }
+                Text("This folder doesn’t contain any DNG or JPEG files. Photos in subfolders are shown when you select the subfolder.")
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color.canvas)
@@ -90,11 +98,6 @@ struct ContentView: View {
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
         @Bindable var library = library
-
-        ToolbarItem(placement: .navigation) {
-            Button("Open Folder", systemImage: "folder") { library.presentOpenPanel() }
-                .help("Open Folder (⌘O)")
-        }
 
         ToolbarItem(placement: .principal) {
             Picker("View", selection: $library.viewMode) {
