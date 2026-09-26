@@ -31,10 +31,15 @@ struct LoupeView: View {
 
 private struct PreviewCanvas: View {
     @Environment(LibraryModel.self) private var library
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let photo: Photo
 
     /// Scroll position where a pan of the zoomed view started; nil when not panning.
     @State private var panStart: CGPoint?
+    @State private var zoomed = ZoomedTracker()
+    /// Set when zooming in from the fit view, until the zoomed view knows where the image goes.
+    @State private var animatesZoomIn = false
+    @State private var transition: ZoomTransition?
 
     var body: some View {
         let preview = library.preview?.photoID == photo.id ? library.preview : nil
@@ -42,10 +47,32 @@ private struct PreviewCanvas: View {
         let isZoomed = library.zoom?.photoID == photo.id
         Group {
             if let zoom = library.zoom, isZoomed {
-                ZoomedCanvas(zoom: zoom, base: image, dragStart: $panStart)
-                    .id(zoom.photoID)  // Fresh scroll state for each photo.
+                ZoomedCanvas(zoom: zoom, base: image, dragStart: $panStart, tracker: zoomed) { frame in
+                    guard animatesZoomIn else { return }
+                    animatesZoomIn = false
+                    transition = ZoomTransition(base: image, detail: nil, frame: frame, zoomingIn: true)
+                }
+                .id(zoom.photoID)  // Fresh scroll state for each photo.
             } else {
                 fitCanvas(image: image, isLoading: preview == nil)
+            }
+        }
+        .overlay {
+            if let transition {
+                ZoomTransitionView(transition: transition) {
+                    if self.transition?.id == transition.id { self.transition = nil }
+                }
+                .id(transition.id)
+            }
+        }
+        .onChange(of: isZoomed) { _, isZoomed in
+            transition = nil
+            if isZoomed {
+                zoomed.detail = nil
+                animatesZoomIn = !reduceMotion
+            } else if !reduceMotion, let frame = zoomed.frame {
+                let detail = zoomed.detail?.photoID == photo.id ? zoomed.detail : nil
+                transition = ZoomTransition(base: image, detail: detail, frame: frame, zoomingIn: false)
             }
         }
         // On the container, so the cursor follows a click that zooms in or out.
@@ -112,6 +139,9 @@ private struct ZoomedCanvas: View {
     let zoom: ZoomState
     let base: CGImage?
     @Binding var dragStart: CGPoint?
+    let tracker: ZoomedTracker
+    /// Called once the image's place at 100% is known, before it is first shown there.
+    let onPlaced: (ZoomedFrame) -> Void
 
     @State private var position = ScrollPosition()
     @State private var scroll = ScrollTracker()
@@ -163,6 +193,10 @@ private struct ZoomedCanvas: View {
                 .scrollPosition($position)
                 .onScrollGeometryChange(for: CGRect.self, of: Self.visibleArea) { _, rect in
                     scroll.origin = rect.origin
+                    tracker.frame = ZoomedFrame(
+                        image: CGRect(origin: CGPoint(x: inset.width - rect.minX, y: inset.height - rect.minY), size: content),
+                        canvas: geometry.size
+                    )
                     let visible = CGRect(
                         x: (rect.minX - inset.width) * displayScale,
                         y: (rect.minY - inset.height) * displayScale,
@@ -171,13 +205,21 @@ private struct ZoomedCanvas: View {
                     )
                     library.setZoomViewport(visible)
                 }
+                .onChange(of: library.detail.map { ObjectIdentifier($0.image) }) {
+                    if let detail = library.detail, detail.photoID == zoom.photoID { tracker.detail = detail }
+                }
                 .onAppear {
                     guard !didScrollToFocus else { return }
                     didScrollToFocus = true
-                    // Keep the clicked point under the cursor.
-                    position.scrollTo(point: CGPoint(
-                        x: zoom.focus.x * content.width + inset.width - zoom.anchor.x * geometry.size.width,
-                        y: zoom.focus.y * content.height + inset.height - zoom.anchor.y * geometry.size.height
+                    // Keep the clicked point under the cursor, as far as the scroll range allows.
+                    let point = CGPoint(
+                        x: min(max(zoom.focus.x * content.width - zoom.anchor.x * geometry.size.width, 0), max(content.width - geometry.size.width, 0)),
+                        y: min(max(zoom.focus.y * content.height - zoom.anchor.y * geometry.size.height, 0), max(content.height - geometry.size.height, 0))
+                    )
+                    position.scrollTo(point: point)
+                    onPlaced(ZoomedFrame(
+                        image: CGRect(origin: CGPoint(x: inset.width - point.x, y: inset.height - point.y), size: content),
+                        canvas: geometry.size
                     ))
                 }
             } else {
@@ -205,6 +247,75 @@ private struct ZoomedCanvas: View {
             width: geometry.containerSize.width,
             height: geometry.containerSize.height
         )
+    }
+}
+
+/// Where the image sits at 100%, in canvas coordinates (top-left origin, below the toolbar).
+private struct ZoomedFrame {
+    let image: CGRect
+    let canvas: CGSize
+
+    /// Where the fit view shows the image.
+    var fit: CGRect { fitRect(image.size, in: canvas, padding: 28) }
+}
+
+/// The zoomed view's last layout and detail, for animating back to fit once it's gone. Not
+/// view state, like `ScrollTracker`: it changes on every frame of a scroll.
+private final class ZoomedTracker {
+    var frame: ZoomedFrame?
+    var detail: DetailImage?
+}
+
+private struct ZoomTransition {
+    let id = UUID()
+    let base: CGImage?
+    /// Full-resolution area shown when zooming out, so the image doesn't turn soft as it starts.
+    let detail: DetailImage?
+    let frame: ZoomedFrame
+    let zoomingIn: Bool
+}
+
+/// Scales the image between its fit and 100% frames, covering the canvas until done. Both
+/// scale and offset change linearly, so the point kept under the cursor stays there throughout.
+private struct ZoomTransitionView: View {
+    @Environment(\.displayScale) private var displayScale
+    let transition: ZoomTransition
+    let onEnd: () -> Void
+    @State private var isDone = false
+
+    var body: some View {
+        let zoomed = transition.frame.image
+        let atFit = isDone != transition.zoomingIn
+        let frame = atFit ? transition.frame.fit : zoomed
+        // An overlay, so the image's full size doesn't change the canvas layout.
+        Color.clear.overlay(alignment: .topLeading) {
+            ZStack(alignment: .topLeading) {
+                if let base = transition.base {
+                    Image(decorative: base, scale: 1)
+                        .resizable()
+                        .interpolation(.high)
+                }
+                if let detail = transition.detail {
+                    Image(decorative: detail.image, scale: 1)
+                        .resizable()
+                        .interpolation(.high)
+                        .frame(width: detail.rect.width / displayScale, height: detail.rect.height / displayScale)
+                        .offset(x: detail.rect.minX / displayScale, y: detail.rect.minY / displayScale)
+                }
+            }
+            .frame(width: zoomed.width, height: zoomed.height, alignment: .topLeading)
+            .clipped()
+            .scaleEffect(frame.width / zoomed.width, anchor: .topLeading)
+            .shadow(color: .black.opacity(atFit ? 0.4 : 0), radius: 8)
+            .offset(x: frame.minX, y: frame.minY)
+        }
+        // The zoomed view extends under the toolbar.
+        .background(Color.canvas.ignoresSafeArea())
+        .allowsHitTesting(false)
+        .onAppear {
+            // A timing curve, not a spring: the completion must come when the image has fully arrived.
+            withAnimation(.easeInOut(duration: 0.25)) { isDone = true } completion: { onEnd() }
+        }
     }
 }
 
