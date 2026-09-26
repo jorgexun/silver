@@ -89,6 +89,8 @@ private struct PreviewCanvas: View {
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
             .contentShape(Rectangle())
+            // Declared first, so a single click waits until it can't be a double-click.
+            .onTapGesture(count: 2) { library.viewMode = .grid }
             .onTapGesture(coordinateSpace: .local) { location in
                 guard let frame, frame.width > 0, frame.height > 0 else { return }
                 let focus = CGPoint(
@@ -143,6 +145,7 @@ private struct ZoomedCanvas: View {
                     .padding(.horizontal, inset.width)
                     .padding(.vertical, inset.height)
                     .contentShape(Rectangle())
+                    .onTapGesture(count: 2) { library.viewMode = .grid }
                     .onTapGesture { library.exitZoom() }
                     .gesture(
                         // Global coordinates: the content moves while it scrolls, so local
