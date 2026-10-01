@@ -20,31 +20,47 @@ struct ExportSheet: View {
     }
 
     private var configuration: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text(model.jobs.count == 1 ? "Export 1 Photo" : "Export \(model.jobs.count) Photos")
-                .font(.headline)
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(model.jobs.count == 1 ? "Export 1 Photo" : "Export \(model.jobs.count) Photos")
+                    .font(.headline)
+                Text("sRGB JPEG files, named like the originals")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
 
             Form {
                 LabeledContent("Folder") {
-                    HStack {
-                        Text(model.outputFolder?.path(percentEncoded: false) ?? "None")
-                            .lineLimit(1)
-                            .truncationMode(.head)
-                            .foregroundStyle(model.outputFolder == nil ? .secondary : .primary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        Button("Choose…") { model.chooseOutputFolder() }
+                    VStack(alignment: .leading, spacing: 3) {
+                        Button {
+                            model.chooseOutputFolder()
+                        } label: {
+                            Label(model.outputFolder?.lastPathComponent ?? "Choose…", systemImage: "folder")
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        .help(model.outputFolder.map { "Export to \($0.path(percentEncoded: false)). Click to choose another folder." } ?? "Choose a folder for the exported files.")
+                        if let folder = model.outputFolder {
+                            Text(displayPath(of: folder.deletingLastPathComponent()))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.head)
+                        }
                     }
                 }
                 LabeledContent("Quality") {
-                    HStack {
-                        Slider(value: $model.quality, in: 0.5...1, step: 0.01)
+                    HStack(spacing: 10) {
+                        TrackSlider(
+                            value: Binding(get: { model.quality }, set: { model.quality = ($0 * 100).rounded() / 100 }),
+                            range: 0.5...1,
+                            origin: 0.5
+                        )
                         Text("\(Int((model.quality * 100).rounded()))")
                             .monospacedDigit()
-                            .frame(width: 30, alignment: .trailing)
+                            .frame(width: 26, alignment: .trailing)
                     }
                 }
-                LabeledContent("Format", value: "JPEG, sRGB")
-                LabeledContent("File Names", value: "Same as original")
                 Picker("If File Exists", selection: $model.existingFilePolicy) {
                     ForEach(ExistingFilePolicy.allCases) { Text($0.title).tag($0) }
                 }
@@ -112,6 +128,16 @@ struct ExportSheet: View {
         }
     }
 }
+
+/// A folder path with the home folder shown as “~”. The sandbox's home is the app container, so
+/// the user's actual home folder is looked up.
+private func displayPath(of url: URL) -> String {
+    let path = url.path(percentEncoded: false)
+    guard let home = userHomePath, path == home || path.hasPrefix(home + "/") else { return path }
+    return "~" + path.dropFirst(home.count)
+}
+
+private let userHomePath: String? = getpwuid(getuid())?.pointee.pw_dir.map { String(cString: $0) }
 
 struct CopyOptionsSheet: View {
     @Environment(LibraryModel.self) private var library

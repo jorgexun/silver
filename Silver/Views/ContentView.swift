@@ -1,10 +1,5 @@
 import SwiftUI
 
-extension Color {
-    /// Neutral background behind photos.
-    static let canvas = Color(white: 0.11)
-}
-
 struct ContentView: View {
     @Environment(LibraryModel.self) private var library
 
@@ -85,14 +80,18 @@ struct ContentView: View {
         }
     }
 
+    /// The photo count, or in the loupe the active photo's position.
     private var subtitle: String {
-        guard library.folderURL != nil, !library.isScanning else { return "" }
+        guard library.folderURL != nil, !library.isScanning, !library.photos.isEmpty else { return "" }
         let count = library.photos.count
-        var text = count == 1 ? "1 photo" : "\(count) photos"
-        if library.selection.count > 1 {
-            text += ", \(library.selection.count) selected"
+        var parts: [String]
+        if library.viewMode == .loupe, let index = library.activeIndex {
+            parts = ["\(index + 1) of \(count)"]
+        } else {
+            parts = [count == 1 ? "1 photo" : "\(count) photos"]
         }
-        return text
+        if library.selection.count > 1 { parts.append("\(library.selection.count) selected") }
+        return parts.joined(separator: " · ")
     }
 
     @ToolbarContentBuilder
@@ -120,11 +119,11 @@ struct ContentView: View {
             Toggle(isOn: $library.showOriginal) {
                 Label("Show Original", systemImage: "square.split.2x1")
             }
-            .help("Show Original (\\)")
+            .help("Show Original (\\): tap to switch, hold to peek")
             .disabled(library.activePhoto == nil || library.isCropping || library.viewMode != .loupe)
 
-            Button("Export", systemImage: "square.and.arrow.up") { library.exportTargets() }
-                .help("Export JPEG (⇧⌘E)")
+            Button("Export", systemImage: "square.and.arrow.up") { library.exportPhotos() }
+                .help(library.targetPhotos.count > 1 ? "Export \(library.targetPhotos.count) Photos (⇧⌘E)" : "Export Photo (⇧⌘E)")
                 .disabled(library.targetPhotos.isEmpty)
         }
 

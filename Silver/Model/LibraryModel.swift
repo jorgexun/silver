@@ -64,7 +64,14 @@ final class LibraryModel {
         didSet { if showOriginal != oldValue { requestPreview() } }
     }
     var thumbnailSize: Double = 180
+    static let thumbnailSizes: ClosedRange<Double> = 110...380
+    /// Columns the grid shows at its width and thumbnail size, for moving up and down by row.
+    var gridColumns = 1
     var isInspectorPresented = true
+    /// The inspector field a value is being typed into. Single-key shortcuts are off meanwhile,
+    /// so the keys reach the field.
+    var valueEditor: UUID?
+    var isEditingValue: Bool { valueEditor != nil }
     var alertMessage: String?
 
     // MARK: Preview
@@ -111,8 +118,8 @@ final class LibraryModel {
 
     private var undoStack: [EditRecord] = []
     private var redoStack: [EditRecord] = []
-    /// Photo and settings when the current slider drag began.
-    private var interactiveStart: (id: Photo.ID, settings: EditSettings)?
+    /// Photo and settings when the current slider drag began, and the undo name for the drag.
+    private var interactiveStart: (id: Photo.ID, settings: EditSettings, name: String)?
     private var cropSessionStart: EditSettings?
     private var straightenBase: CropRect?
 
@@ -315,8 +322,7 @@ final class LibraryModel {
                   let anchor = anchorID,
                   let from = photos.firstIndex(where: { $0.id == anchor }),
                   let to = photos.firstIndex(where: { $0.id == photo.id }) {
-            selection = Set(photos[min(from, to)...max(from, to)].map(\.id))
-            setActive(photo.id)
+            selectRange(from: from, to: to)
         } else {
             select(photo)
         }
@@ -350,22 +356,40 @@ final class LibraryModel {
 
     func selectNext() { step(1) }
     func selectPrevious() { step(-1) }
+    func selectBelow() { step(gridColumns) }
+    func selectAbove() { step(-gridColumns) }
 
-    private func step(_ offset: Int) {
+    /// Like Shift-clicking the photo `offset` places from the active one.
+    func extendSelection(by offset: Int) { step(offset, extend: true) }
+
+    private func step(_ offset: Int, extend: Bool = false) {
         guard !photos.isEmpty else { return }
-        let index = activeIndex.map { $0 + offset } ?? 0
-        guard photos.indices.contains(index) else { return }
-        select(photos[index])
+        let current = activeIndex
+        var index = current.map { $0 + offset } ?? 0
+        // A row step past the first or last row stops at the first or last photo, as in Photos.
+        if abs(offset) > 1 { index = min(max(index, 0), photos.count - 1) }
+        guard photos.indices.contains(index), index != current else { return }
+        if extend, let anchor = anchorID.flatMap({ id in photos.firstIndex { $0.id == id } }) {
+            selectRange(from: anchor, to: index)
+        } else {
+            select(photos[index])
+        }
+    }
+
+    /// Selects the photos between two indices and makes the second active.
+    private func selectRange(from: Int, to: Int) {
+        selection = Set(photos[min(from, to)...max(from, to)].map(\.id))
+        setActive(photos[to].id)
     }
 
     private func setActive(_ id: Photo.ID) {
         guard id != activeID else { return }
         endCrop()
-        if interactiveStart != nil {
+        if let start = interactiveStart {
             // A slider drag spans the switch: record it for the photo it started on, then
             // keep tracking the drag for the new photo.
             endInteractiveEdit()
-            if let photo = photosByID[id] { interactiveStart = (id, photo.settings) }
+            if let photo = photosByID[id] { interactiveStart = (id, photo.settings, start.name) }
         }
         if zoom != nil {
             // Stay at 100% on the same part of the frame, e.g. to compare focus across a burst.
@@ -385,7 +409,7 @@ final class LibraryModel {
     // MARK: - Editing
 
     /// Changes the active photo. Called continuously while a slider is dragged.
-    func updateActive(_ change: (inout EditSettings) -> Void) {
+    func updateActive(actionName: String = "Edit", _ change: (inout EditSettings) -> Void) {
         guard let photo = activePhoto else { return }
         let before = photo.settings
         var settings = before
@@ -394,19 +418,25 @@ final class LibraryModel {
         photo.settings = settings
         didChangeSettings(of: [photo])
         if interactiveStart == nil, !isCropping {
-            pushUndo(EditRecord(name: "Edit", changes: [Change(id: photo.id, before: before, after: settings)]))
+            pushUndo(EditRecord(name: actionName, changes: [Change(id: photo.id, before: before, after: settings)]))
         }
     }
 
-    func beginInteractiveEdit() {
+    /// Resets some groups of the active photo's settings, e.g. from a section's reset button.
+    func resetActive(_ groups: AdjustmentGroups, actionName: String) {
+        updateActive(actionName: actionName) { $0 = $0.merging(groups, from: .default) }
+    }
+
+    /// Starts a slider drag, recorded as one undoable action named `actionName`, e.g. “Exposure”.
+    func beginInteractiveEdit(_ actionName: String) {
         guard !isCropping, let photo = activePhoto else { return }
-        interactiveStart = (photo.id, photo.settings)
+        interactiveStart = (photo.id, photo.settings, actionName)
     }
 
     func endInteractiveEdit() {
         defer { interactiveStart = nil }
         guard let start = interactiveStart, let photo = photosByID[start.id], photo.settings != start.settings else { return }
-        pushUndo(EditRecord(name: "Edit", changes: [Change(id: photo.id, before: start.settings, after: photo.settings)]))
+        pushUndo(EditRecord(name: start.name, changes: [Change(id: photo.id, before: start.settings, after: photo.settings)]))
     }
 
     /// Applies new settings to several photos as one undoable action.
@@ -431,28 +461,39 @@ final class LibraryModel {
         }
     }
 
-    func resetAdjustments() {
+    /// Resets `photos`, by default the selected photos.
+    func resetAdjustments(of photos: [Photo]? = nil) {
         endCrop()
-        apply(targetPhotos.map { ($0, EditSettings.default) }, actionName: "Reset Adjustments")
+        apply((photos ?? targetPhotos).map { ($0, EditSettings.default) }, actionName: "Reset Adjustments")
     }
 
     // MARK: - Copy and paste
 
-    func copyAdjustments(groups: AdjustmentGroups? = nil) {
-        guard let photo = activePhoto else { return }
+    /// Copies the settings of `photo`, by default the active photo.
+    func copyAdjustments(from photo: Photo? = nil, groups: AdjustmentGroups? = nil) {
+        guard let photo = photo ?? activePhoto else { return }
         clipboard = photo.settings
         if let groups { clipboardGroups = groups }
     }
 
     var canPaste: Bool { clipboard != nil && activePhoto != nil }
 
-    /// Single-key shortcuts are disabled while a sheet is up.
     var isShowingSheet: Bool { export.isPresented || isShowingCopyOptions }
 
-    func pasteAdjustments(toSelected: Bool) {
+    /// Single-key shortcuts (arrows, letters, Space) would take keys meant for a sheet or a field.
+    var allowsSingleKeyShortcuts: Bool { !isShowingSheet && !isEditingValue }
+
+    /// Photos a context-menu command acts on: the selection when `photo` is part of it, as in
+    /// Finder, otherwise just `photo`.
+    func contextTargets(for photo: Photo) -> [Photo] {
+        selection.contains(photo.id) ? selectedPhotos : [photo]
+    }
+
+    /// Pastes onto `photos`, by default the selected photos, as Paste Edits does in Photos.
+    func pasteAdjustments(to photos: [Photo]? = nil) {
         guard let clipboard else { return }
         endCrop()
-        let targets = toSelected ? targetPhotos : (activePhoto.map { [$0] } ?? [])
+        let targets = photos ?? targetPhotos
         let groups = clipboardGroups
         let updates = targets.map { photo -> (Photo, EditSettings) in
             var settings = photo.settings.merging(groups, from: clipboard)
@@ -461,7 +502,7 @@ final class LibraryModel {
             }
             return (photo, settings)
         }
-        apply(updates, actionName: toSelected ? "Paste to Selected" : "Paste Adjustments")
+        apply(updates, actionName: "Paste Adjustments")
     }
 
     // MARK: - Undo
@@ -565,6 +606,16 @@ final class LibraryModel {
         }
     }
 
+    /// Switches the crop to landscape or portrait; square crops stay as they are.
+    func setCropOrientation(portrait: Bool) {
+        guard let photo = activePhoto, let size = photo.geometrySize else { return }
+        guard CropGeometry.orientation(of: photo.settings.crop, imageSize: size) == (portrait ? .landscape : .portrait) else { return }
+        rotateCropOrientation()
+    }
+
+    /// Whether the photo is being straightened, with the slider or by dragging on the canvas.
+    var isStraightening: Bool { straightenBase != nil }
+
     func beginStraighten() {
         straightenBase = activePhoto?.settings.crop
     }
@@ -576,7 +627,7 @@ final class LibraryModel {
     func setStraighten(_ angle: Double) {
         guard let photo = activePhoto, let size = photo.geometrySize else { return }
         let base = straightenBase ?? photo.settings.crop
-        let rounded = (angle * 100).rounded() / 100
+        let rounded = (min(max(angle, -45), 45) * 100).rounded() / 100
         updateActive { settings in
             settings.straighten = rounded
             settings.crop = CropGeometry.fitted(base, angle: rounded, imageSize: size).rounded
@@ -648,6 +699,56 @@ final class LibraryModel {
                 }
             }
             renderTask = nil
+        }
+    }
+
+    // MARK: - Viewing
+
+    /// Space: opens the active photo from the grid, or goes back to the grid, as in Photos.
+    func toggleLoupe() {
+        viewMode = viewMode == .grid ? .loupe : .grid
+    }
+
+    /// When `\` turned the original on; see `endOriginalPeek()`.
+    private var originalKeyDown: Date?
+
+    /// Shows or hides the original. A key held down instead shows it only until it's released,
+    /// like M in Photos.
+    func toggleOriginal() {
+        showOriginal.toggle()
+        originalKeyDown = showOriginal && NSApp.currentEvent?.type == .keyDown ? .now : nil
+    }
+
+    /// Called when `\` is released: after a hold rather than a tap, goes back to the edited photo.
+    func endOriginalPeek() {
+        guard let start = originalKeyDown else { return }
+        originalKeyDown = nil
+        if showOriginal, Date.now.timeIntervalSince(start) > 0.35 { showOriginal = false }
+    }
+
+    var canZoomIn: Bool {
+        viewMode == .grid ? thumbnailSize < Self.thumbnailSizes.upperBound : zoom == nil && activePhoto != nil && !isCropping
+    }
+
+    var canZoomOut: Bool {
+        viewMode == .grid ? thumbnailSize > Self.thumbnailSizes.lowerBound : zoom != nil
+    }
+
+    /// ⌘+: larger thumbnails in the grid, 100% in the loupe.
+    func zoomIn() {
+        if viewMode == .grid {
+            thumbnailSize = min(thumbnailSize * 1.25, Self.thumbnailSizes.upperBound)
+        } else if zoom == nil {
+            toggleZoom()
+        }
+    }
+
+    /// ⌘−: smaller thumbnails in the grid, fit in the loupe.
+    func zoomOut() {
+        if viewMode == .grid {
+            thumbnailSize = max(thumbnailSize / 1.25, Self.thumbnailSizes.lowerBound)
+        } else {
+            exitZoom()
         }
     }
 
@@ -823,10 +924,11 @@ final class LibraryModel {
 
     // MARK: - Export
 
-    func exportTargets() {
+    /// Exports `photos`, by default the selected photos.
+    func exportPhotos(_ photos: [Photo]? = nil) {
         endCrop()
         flushSaves()
-        export.present(jobs: targetPhotos.map { ExportJob(source: $0.url, settings: $0.settings) })
+        export.present(jobs: (photos ?? targetPhotos).map { ExportJob(source: $0.url, settings: $0.settings) })
     }
 
     func revealActiveInFinder() {

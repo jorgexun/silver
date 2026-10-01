@@ -184,11 +184,11 @@ nonisolated enum AspectRatio: String, Codable, CaseIterable, Identifiable, Senda
         switch self {
         case .free: "Free"
         case .original: "Original"
-        case .square: "1 : 1"
-        case .ratio5x4: "5 : 4"
-        case .ratio4x3: "4 : 3"
-        case .ratio3x2: "3 : 2"
-        case .ratio16x9: "16 : 9"
+        case .square: "1:1"
+        case .ratio5x4: "5:4"
+        case .ratio4x3: "4:3"
+        case .ratio3x2: "3:2"
+        case .ratio16x9: "16:9"
         }
     }
 

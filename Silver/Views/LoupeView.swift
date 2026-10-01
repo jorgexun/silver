@@ -19,7 +19,7 @@ struct LoupeView: View {
 
             Divider()
             FilmstripView()
-                .frame(height: 88)
+                .frame(height: FilmstripView.height)
         }
     }
 
@@ -77,14 +77,12 @@ private struct PreviewCanvas: View {
         }
         // On the container, so the cursor follows a click that zooms in or out.
         .cursor(cursor(isZoomed: isZoomed, hasImage: image != nil))
+        .contextMenu { PhotoContextMenu(photo: photo) }
         .overlay(alignment: .top) {
             if library.showOriginal {
                 Text("Original")
-                    .font(.callout.weight(.medium))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background(.ultraThinMaterial, in: Capsule())
-                    .padding(.top, 10)
+                    .canvasLabel()
+                    .padding(.top, 12)
             }
         }
     }
@@ -108,10 +106,7 @@ private struct PreviewCanvas: View {
                         .padding(padding)
                 }
                 if isLoading {
-                    ProgressView()
-                        .controlSize(.small)
-                        .padding(8)
-                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 6))
+                    LoadingIndicator()
                 }
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
@@ -119,15 +114,24 @@ private struct PreviewCanvas: View {
             // Declared first, so a single click waits until it can't be a double-click.
             .onTapGesture(count: 2) { library.viewMode = .grid }
             .onTapGesture(coordinateSpace: .local) { location in
-                guard let frame, frame.width > 0, frame.height > 0 else { return }
-                let focus = CGPoint(
-                    x: min(max((location.x - frame.minX) / frame.width, 0), 1),
-                    y: min(max((location.y - frame.minY) / frame.height, 0), 1)
-                )
-                let anchor = CGPoint(x: location.x / geometry.size.width, y: location.y / geometry.size.height)
-                library.toggleZoom(focus: focus, anchor: anchor)
+                zoom(at: location, frame: frame, canvas: geometry.size)
             }
+            // Pinching out zooms to 100% where the fingers are, as in Photos.
+            .simultaneousGesture(MagnifyGesture().onEnded { value in
+                if value.magnification > 1.15 { zoom(at: value.startLocation, frame: frame, canvas: geometry.size) }
+            })
         }
+    }
+
+    /// Zooms to 100% keeping the image point at `location` under it.
+    private func zoom(at location: CGPoint, frame: CGRect?, canvas: CGSize) {
+        guard let frame, frame.width > 0, frame.height > 0 else { return }
+        let focus = CGPoint(
+            x: min(max((location.x - frame.minX) / frame.width, 0), 1),
+            y: min(max((location.y - frame.minY) / frame.height, 0), 1)
+        )
+        let anchor = CGPoint(x: location.x / canvas.width, y: location.y / canvas.height)
+        library.toggleZoom(focus: focus, anchor: anchor)
     }
 }
 
@@ -191,6 +195,11 @@ private struct ZoomedCanvas: View {
                 }
                 .scrollIndicators(.automatic)
                 .scrollPosition($position)
+                // Pinching in goes back to fit. On the scroll view, not the content: on the same
+                // view as the pan's drag, it holds back the drag's updates until the mouse is up.
+                .simultaneousGesture(MagnifyGesture().onEnded { value in
+                    if value.magnification < 0.87 { library.exitZoom() }
+                })
                 .onScrollGeometryChange(for: CGRect.self, of: Self.visibleArea) { _, rect in
                     scroll.origin = rect.origin
                     tracker.frame = ZoomedFrame(
@@ -231,7 +240,7 @@ private struct ZoomedCanvas: View {
                             .aspectRatio(contentMode: .fit)
                             .padding(28)
                     }
-                    ProgressView().controlSize(.small)
+                    LoadingIndicator()
                 }
                 .frame(width: geometry.size.width, height: geometry.size.height)
             }
@@ -247,6 +256,27 @@ private struct ZoomedCanvas: View {
             width: geometry.containerSize.width,
             height: geometry.containerSize.height
         )
+    }
+}
+
+/// Shown while a render is on its way. It appears only after a moment, so it doesn't flash
+/// when switching between photos quickly.
+private struct LoadingIndicator: View {
+    @State private var isVisible = false
+
+    var body: some View {
+        ZStack {
+            if isVisible {
+                ProgressView()
+                    .controlSize(.small)
+                    .padding(10)
+                    .glassEffect(.regular, in: .circle)
+            }
+        }
+        .task {
+            try? await Task.sleep(for: .milliseconds(300))
+            isVisible = true
+        }
     }
 }
 
@@ -326,7 +356,7 @@ private final class ScrollTracker {
 }
 
 private enum CanvasCursor: Equatable {
-    case arrow, zoomIn, openHand, closedHand
+    case arrow, zoomIn, openHand, closedHand, rotate, crosshair
     case resize(FrameResizePosition)
 
     var style: PointerStyle {
@@ -335,6 +365,8 @@ private enum CanvasCursor: Equatable {
         case .zoomIn: .zoomIn
         case .openHand: .grabIdle
         case .closedHand: .grabActive
+        case .rotate: .image(Image(nsImage: rotateCursorImage), hotSpot: .center)
+        case .crosshair: .rectSelection
         case .resize(let position): .frameResize(position: position)
         }
     }
@@ -345,9 +377,13 @@ private enum CanvasCursor: Equatable {
         case .zoomIn: .zoomIn
         case .openHand: .openHand
         case .closedHand: .closedHand
+        case .rotate: Self.rotateCursor
+        case .crosshair: .crosshair
         case .resize(let position): .frameResize(position: Self.appKitPosition(position), directions: .all)
         }
     }
+
+    private static let rotateCursor = NSCursor(image: rotateCursorImage, hotSpot: NSPoint(x: 12, y: 12))
 
     private static func appKitPosition(_ position: FrameResizePosition) -> NSCursor.FrameResizePosition {
         switch position {
@@ -361,6 +397,42 @@ private enum CanvasCursor: Equatable {
         case .bottomTrailing: .bottomRight
         }
     }
+}
+
+/// A curved double arrow for rotating, black on a white outline like the system cursors. There's
+/// no system cursor for it.
+private let rotateCursorImage = NSImage(size: NSSize(width: 24, height: 24), flipped: false) { _ in
+    let center = CGPoint(x: 12, y: 9)
+    let radius: CGFloat = 8
+    let arc = NSBezierPath()
+    arc.appendArc(withCenter: center, radius: radius, startAngle: 25, endAngle: 155)
+    // An arrowhead at each end, pointing on around the circle.
+    let heads = [(degrees: 25.0, turn: -1.0), (degrees: 155.0, turn: 1.0)].map { end in
+        let theta = end.degrees * .pi / 180
+        let point = CGPoint(x: center.x + radius * cos(theta), y: center.y + radius * sin(theta))
+        let along = CGVector(dx: -sin(theta) * end.turn, dy: cos(theta) * end.turn)
+        let across = CGVector(dx: cos(theta), dy: sin(theta))
+        let head = NSBezierPath()
+        head.move(to: CGPoint(x: point.x + along.dx * 4, y: point.y + along.dy * 4))
+        head.line(to: CGPoint(x: point.x + across.dx * 3.5 - along.dx, y: point.y + across.dy * 3.5 - along.dy))
+        head.line(to: CGPoint(x: point.x - across.dx * 3.5 - along.dx, y: point.y - across.dy * 3.5 - along.dy))
+        head.close()
+        return head
+    }
+    NSColor.white.set()
+    arc.lineWidth = 4
+    arc.stroke()
+    for head in heads {
+        head.lineWidth = 2.5
+        head.lineJoinStyle = .round
+        head.stroke()
+        head.fill()
+    }
+    NSColor.black.set()
+    arc.lineWidth = 1.5
+    arc.stroke()
+    heads.forEach { $0.fill() }
+    return true
 }
 
 extension View {
@@ -447,10 +519,14 @@ private enum CropHandle: CaseIterable, Hashable {
 private enum CropTarget: Equatable {
     case move
     case resize(CropHandle)
+    /// Outside the crop: dragging turns the photo, as in Lightroom.
+    case rotate
+    /// ⌘-drag: a line along something that should be level or upright, like Lightroom's angle tool.
+    case level
 
-    /// Corners and edges within a few points of the crop outline, then the inside of the crop;
-    /// nil outside it.
-    init?(at point: CGPoint, in frame: CGRect) {
+    /// Corners and edges within a few points of the crop outline, then the inside of the crop,
+    /// then anywhere outside it.
+    init(at point: CGPoint, in frame: CGRect) {
         let cornerReach: CGFloat = 12
         let edgeReach: CGFloat = 8
         // For a narrow crop, the nearer side wins.
@@ -469,9 +545,18 @@ private enum CropTarget: Equatable {
         } else if frame.contains(point) {
             self = .move
         } else {
-            return nil
+            self = .rotate
         }
     }
+}
+
+/// A drag in the crop editor: what it grabbed, and the crop and angle when it began.
+private struct CropDrag {
+    let target: CropTarget
+    let crop: CropRect
+    let straighten: Double
+    /// Direction of the pointer from the photo's center when the drag began, in degrees.
+    let pointerAngle: Double
 }
 
 struct CropEditorView: View {
@@ -479,10 +564,11 @@ struct CropEditorView: View {
     let photo: Photo
     let image: CGImage?
 
-    /// What the current drag grabbed and the crop when it started; drags starting outside the
-    /// crop do nothing.
-    @State private var drag: (target: CropTarget, start: CropRect)?
+    @State private var drag: CropDrag?
     @State private var hover: CropTarget?
+    /// Holding ⌘ turns a drag into drawing a level line.
+    @State private var isCommandDown = false
+    @State private var levelLine: (start: CGPoint, end: CGPoint)?
 
     var body: some View {
         GeometryReader { geometry in
@@ -490,6 +576,7 @@ struct CropEditorView: View {
                 editor(viewSize: geometry.size, imageSize: imageSize)
             }
         }
+        .onModifierKeysChanged(mask: .command) { _, keys in isCommandDown = keys.contains(.command) }
     }
 
     @ViewBuilder
@@ -526,8 +613,10 @@ struct CropEditorView: View {
             .fill(Color.black.opacity(0.6), style: FillStyle(eoFill: true))
             .allowsHitTesting(false)
 
-            thirdsGrid(in: cropFrame)
-                .stroke(Color.white.opacity(drag != nil ? 0.55 : 0.25), lineWidth: 0.5)
+            // Thirds while framing; a finer grid while straightening, to line up with.
+            let isStraightening = library.isStraightening
+            gridPath(in: cropFrame, fine: isStraightening)
+                .stroke(Color.white.opacity(drag != nil || isStraightening ? 0.5 : 0.25), lineWidth: 0.5)
                 .allowsHitTesting(false)
 
             Rectangle()
@@ -535,10 +624,19 @@ struct CropEditorView: View {
                 .stroke(Color.white.opacity(0.9), lineWidth: 1)
                 .allowsHitTesting(false)
 
-            ForEach(CropHandle.allCases, id: \.self) { handle in
-                handleView(handle)
-                    .position(handle.point(in: cropFrame))
-                    .allowsHitTesting(false)
+            handlesPath(around: cropFrame)
+                .fill(Color.white)
+                .shadow(color: .black.opacity(0.5), radius: 1)
+                .allowsHitTesting(false)
+
+            if let levelLine {
+                Path { path in
+                    path.move(to: levelLine.start)
+                    path.addLine(to: levelLine.end)
+                }
+                .stroke(Color.white, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+                .shadow(color: .black.opacity(0.6), radius: 1)
+                .allowsHitTesting(false)
             }
         }
         .frame(width: viewSize.width, height: viewSize.height)
@@ -551,41 +649,63 @@ struct CropEditorView: View {
             }
         }
         .gesture(dragGesture(cropFrame: cropFrame, box: box, imageSize: imageSize))
+        // Double-clicking inside the crop finishes it, as in Lightroom.
+        .simultaneousGesture(SpatialTapGesture(count: 2).onEnded { value in
+            if cropFrame.contains(value.location) { library.endCrop() }
+        })
         .cursor(cursor)
     }
 
     /// A drag keeps the cursor of what it grabbed, even when the pointer moves off it.
     private var cursor: CanvasCursor {
-        let target = drag?.target ?? hover
-        switch target {
+        if drag == nil, isCommandDown, hover != nil { return .crosshair }
+        switch drag?.target ?? hover {
         case .move: return drag == nil ? .openHand : .closedHand
         case .resize(let handle): return .resize(handle.resizePosition)
+        case .rotate: return .rotate
+        case .level: return .crosshair
         case nil: return .arrow
         }
     }
 
-    private func handleView(_ handle: CropHandle) -> some View {
-        Group {
-            if handle.isCorner {
-                RoundedRectangle(cornerRadius: 2)
-                    .fill(Color.white)
-                    .frame(width: 11, height: 11)
-            } else {
-                Capsule()
-                    .fill(Color.white)
-                    .frame(width: [.top, .bottom].contains(handle) ? 22 : 5, height: [.top, .bottom].contains(handle) ? 5 : 22)
+    /// Corner brackets and edge bars just outside the crop, so they don't cover the photo.
+    private func handlesPath(around frame: CGRect) -> Path {
+        let thickness: CGFloat = 3
+        let length = min(18, frame.width / 2, frame.height / 2) + thickness
+        let bar: CGFloat = 18
+        return Path { path in
+            for handle in CropHandle.allCases {
+                let point = handle.point(in: frame)
+                // Outward direction of the handle's sides; 0 along an edge.
+                let dx: CGFloat = handle.movesLeft ? -1 : handle.movesRight ? 1 : 0
+                let dy: CGFloat = handle.movesTop ? -1 : handle.movesBottom ? 1 : 0
+                if handle.isCorner {
+                    let x = dx < 0 ? point.x - thickness : point.x + thickness - length
+                    let y = dy < 0 ? point.y - thickness : point.y + thickness - length
+                    path.addRect(CGRect(x: x, y: dy < 0 ? point.y - thickness : point.y, width: length, height: thickness))
+                    path.addRect(CGRect(x: dx < 0 ? point.x - thickness : point.x, y: y, width: thickness, height: length))
+                } else if dx == 0 {
+                    path.addRect(CGRect(x: point.x - bar / 2, y: dy < 0 ? point.y - thickness : point.y, width: bar, height: thickness))
+                } else {
+                    path.addRect(CGRect(x: dx < 0 ? point.x - thickness : point.x, y: point.y - bar / 2, width: thickness, height: bar))
+                }
             }
         }
-        .shadow(color: .black.opacity(0.5), radius: 1)
     }
 
-    private func thirdsGrid(in rect: CGRect) -> Path {
-        Path { path in
-            for i in 1...2 {
-                let x = rect.minX + rect.width * CGFloat(i) / 3
-                let y = rect.minY + rect.height * CGFloat(i) / 3
+    /// Rule-of-thirds lines, or a grid of roughly square cells when `fine`.
+    private func gridPath(in rect: CGRect, fine: Bool) -> Path {
+        let cell = max(min(rect.width, rect.height) / 6, 1)
+        let columns = fine ? max(Int((rect.width / cell).rounded()), 2) : 3
+        let rows = fine ? max(Int((rect.height / cell).rounded()), 2) : 3
+        return Path { path in
+            for i in 1..<columns {
+                let x = rect.minX + rect.width * CGFloat(i) / CGFloat(columns)
                 path.move(to: CGPoint(x: x, y: rect.minY))
                 path.addLine(to: CGPoint(x: x, y: rect.maxY))
+            }
+            for i in 1..<rows {
+                let y = rect.minY + rect.height * CGFloat(i) / CGFloat(rows)
                 path.move(to: CGPoint(x: rect.minX, y: y))
                 path.addLine(to: CGPoint(x: rect.maxX, y: y))
             }
@@ -593,29 +713,75 @@ struct CropEditorView: View {
     }
 
     private func dragGesture(cropFrame: CGRect, box: CGRect, imageSize: CGSize) -> some Gesture {
-        DragGesture(minimumDistance: 0)
+        let center = CGPoint(x: box.midX, y: box.midY)
+        return DragGesture(minimumDistance: 0)
             .onChanged { value in
                 let settings = photo.settings
-                if drag == nil, let target = CropTarget(at: value.startLocation, in: cropFrame) {
-                    drag = (target, settings.crop)
+                // The event's own modifiers, not the keyboard's state when the handler runs.
+                let modifiers = NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags
+                if drag == nil {
+                    let target = modifiers.contains(.command) ? .level : CropTarget(at: value.startLocation, in: cropFrame)
+                    drag = CropDrag(
+                        target: target,
+                        crop: settings.crop,
+                        straighten: settings.straighten,
+                        pointerAngle: angle(of: value.startLocation, around: center)
+                    )
+                    // Shows the finer grid, and keeps the crop the angle started from.
+                    if target == .rotate || target == .level { library.beginStraighten() }
                 }
                 guard let drag else { return }
-                let start = drag.start
-                let dx = value.translation.width / box.width
-                let dy = value.translation.height / box.height
-                let normalizedAspect = CropGeometry.pixelAspect(for: settings.aspectRatio, matching: start, imageSize: imageSize)
-                    .map { $0 / Double(imageSize.width / imageSize.height) }
-                let proposal = proposedRect(from: start, target: drag.target, dx: dx, dy: dy, aspect: normalizedAspect)
-                let rect = CropGeometry.constrained(from: settings.crop, to: proposal, angle: settings.straighten, imageSize: imageSize)
-                library.setCrop(rect)
+                switch drag.target {
+                case .rotate:
+                    // The photo turns with the pointer around its center.
+                    let turn = remainder(angle(of: value.location, around: center) - drag.pointerAngle, 360)
+                    library.setStraighten(drag.straighten + turn)
+                case .level:
+                    levelLine = (value.startLocation, value.location)
+                case .move, .resize:
+                    let dx = value.translation.width / box.width
+                    let dy = value.translation.height / box.height
+                    // A fixed ratio in normalized units; Shift keeps a free crop's proportions.
+                    let fixed = CropGeometry.pixelAspect(for: settings.aspectRatio, matching: drag.crop, imageSize: imageSize)
+                        .map { $0 / Double(imageSize.width / imageSize.height) }
+                    let aspect = fixed ?? (modifiers.contains(.shift) ? drag.crop.width / drag.crop.height : nil)
+                    let proposal = proposedRect(
+                        from: drag.crop, target: drag.target, dx: dx, dy: dy,
+                        aspect: aspect, fromCenter: modifiers.contains(.option)
+                    )
+                    let rect = CropGeometry.constrained(from: settings.crop, to: proposal, angle: settings.straighten, imageSize: imageSize)
+                    library.setCrop(rect)
+                }
             }
             .onEnded { value in
+                if let levelLine { level(along: levelLine) }
+                if drag?.target == .rotate || drag?.target == .level { library.endStraighten() }
+                levelLine = nil
                 drag = nil
                 hover = CropTarget(at: value.location, in: cropFrame)
             }
     }
 
-    private func proposedRect(from start: CropRect, target: CropTarget, dx: Double, dy: Double, aspect: Double?) -> CropRect {
+    /// Direction from `center` to `point` in degrees, clockwise from the right (y points down).
+    private func angle(of point: CGPoint, around center: CGPoint) -> Double {
+        atan2(point.y - center.y, point.x - center.x) * 180 / .pi
+    }
+
+    /// Turns the photo so that a line drawn along a horizon becomes level, or one drawn along
+    /// something upright becomes vertical.
+    private func level(along line: (start: CGPoint, end: CGPoint)) {
+        let dx = line.end.x - line.start.x, dy = line.end.y - line.start.y
+        guard hypot(dx, dy) > 12 else { return }  // A click, not a line.
+        var tilt = atan2(dy, dx) * 180 / .pi
+        // The direction it was drawn in doesn't matter.
+        if tilt > 90 { tilt -= 180 } else if tilt <= -90 { tilt += 180 }
+        if abs(tilt) > 45 { tilt -= tilt > 0 ? 90 : -90 }
+        library.setStraighten(photo.settings.straighten - tilt)
+    }
+
+    /// The crop after dragging `target` by `dx`, `dy` (normalized). With `aspect`, it keeps that
+    /// width-to-height ratio in normalized units; with `fromCenter`, the opposite side moves too.
+    private func proposedRect(from start: CropRect, target: CropTarget, dx: Double, dy: Double, aspect: Double?, fromCenter: Bool) -> CropRect {
         guard case .resize(let handle) = target else {
             let x = min(max(start.x + dx, 0), 1 - start.width)
             let y = min(max(start.y + dy, 0), 1 - start.height)
@@ -624,30 +790,47 @@ struct CropEditorView: View {
 
         let minSize = CropGeometry.minimumSize
         var minX = start.minX, maxX = start.maxX, minY = start.minY, maxY = start.maxY
-        if handle.movesLeft { minX = min(max(start.minX + dx, 0), maxX - minSize) }
-        if handle.movesRight { maxX = max(min(start.maxX + dx, 1), minX + minSize) }
-        if handle.movesTop { minY = min(max(start.minY + dy, 0), maxY - minSize) }
-        if handle.movesBottom { maxY = max(min(start.maxY + dy, 1), minY + minSize) }
-
-        if let aspect {
-            var width = maxX - minX
-            var height = maxY - minY
-            // An edge keeps the ratio by resizing the other axis about the crop's center.
-            if handle == .left || handle == .right {
-                return CropRect(centerX: (minX + maxX) / 2, centerY: start.midY, width: width, height: width / aspect)
-            }
-            if handle == .top || handle == .bottom {
-                return CropRect(centerX: start.midX, centerY: (minY + maxY) / 2, width: height * aspect, height: height)
-            }
-            // A corner grows the shorter side to match, anchored at the opposite corner.
-            if width / height > aspect {
-                height = width / aspect
-            } else {
-                width = height * aspect
-            }
-            if handle.movesLeft { minX = maxX - width } else { maxX = minX + width }
-            if handle.movesTop { minY = maxY - height } else { maxY = minY + height }
+        if fromCenter {
+            var halfWidth = start.width / 2, halfHeight = start.height / 2
+            if handle.movesLeft { halfWidth -= dx } else if handle.movesRight { halfWidth += dx }
+            if handle.movesTop { halfHeight -= dy } else if handle.movesBottom { halfHeight += dy }
+            halfWidth = min(max(halfWidth, minSize / 2), min(start.midX, 1 - start.midX))
+            halfHeight = min(max(halfHeight, minSize / 2), min(start.midY, 1 - start.midY))
+            minX = start.midX - halfWidth
+            maxX = start.midX + halfWidth
+            minY = start.midY - halfHeight
+            maxY = start.midY + halfHeight
+        } else {
+            if handle.movesLeft { minX = min(max(start.minX + dx, 0), maxX - minSize) }
+            if handle.movesRight { maxX = max(min(start.maxX + dx, 1), minX + minSize) }
+            if handle.movesTop { minY = min(max(start.minY + dy, 0), maxY - minSize) }
+            if handle.movesBottom { maxY = max(min(start.maxY + dy, 1), minY + minSize) }
         }
-        return CropRect(minX: minX, minY: minY, maxX: maxX, maxY: maxY)
+
+        guard let aspect else { return CropRect(minX: minX, minY: minY, maxX: maxX, maxY: maxY) }
+        var width = maxX - minX
+        var height = maxY - minY
+        // An edge sets the other axis to match; a corner grows the shorter side.
+        if handle == .left || handle == .right {
+            height = width / aspect
+        } else if handle == .top || handle == .bottom {
+            width = height * aspect
+        } else if width / height > aspect {
+            height = width / aspect
+        } else {
+            width = height * aspect
+        }
+        // The axis an edge doesn't move stays centered; a corner stays anchored at the opposite
+        // corner, or at the center.
+        func center(movesLow: Bool, movesHigh: Bool, low: Double, high: Double, size: Double, middle: Double) -> Double {
+            if fromCenter || !(movesLow || movesHigh) { return middle }
+            return movesLow ? high - size / 2 : low + size / 2
+        }
+        return CropRect(
+            centerX: center(movesLow: handle.movesLeft, movesHigh: handle.movesRight, low: minX, high: maxX, size: width, middle: start.midX),
+            centerY: center(movesLow: handle.movesTop, movesHigh: handle.movesBottom, low: minY, high: maxY, size: height, middle: start.midY),
+            width: width,
+            height: height
+        )
     }
 }

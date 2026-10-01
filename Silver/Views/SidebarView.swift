@@ -20,15 +20,6 @@ struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
-        .overlay {
-            if folders.roots.isEmpty {
-                VStack(spacing: 8) {
-                    Text("No Folders")
-                        .foregroundStyle(.secondary)
-                    Button("Add Folder…") { library.presentAddFolderPanel() }
-                }
-            }
-        }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             HStack {
                 Button("Add Folder", systemImage: "plus") { library.presentAddFolderPanel() }

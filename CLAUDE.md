@@ -27,10 +27,19 @@ swiftc -O -o /tmp/harness \
 
 The harness file must be named `main.swift` for top-level code (don't pass `-parse-as-library`). Before rendering, it must set `ToneMapping.metalLibraryURL` to a built `default.metallib` (e.g. from the app bundle in DerivedData); otherwise tone mapping is skipped. When comparing renders, compare 8-bit rendered pixels: `CIAreaAverage` over large cropped extents gives misleading results.
 
+Views can be checked the same way, without a display:
+- Compile every file except `SilverApp.swift` with Xcode's Swift flags: `-default-isolation MainActor` and the `-enable-upcoming-feature` list from the build log.
+- Host `ContentView` in an `NSHostingView` (with `sceneBridgingOptions = [.toolbars, .title]` for the toolbar) and write `cacheDisplay(in:to:)` output to PNG.
+- Mouse and key events sent with `window.sendEvent` drive SwiftUI gestures and text fields. AppKit tracking loops, such as split view dividers, need the drag and mouse-up queued with `NSApp.postEvent` first.
+- Events sent with `window.sendEvent` don't set `NSApp.currentEvent`, where the crop editor reads modifier keys from. Queue those drags with `NSApp.postEvent` to test ⇧, ⌥ and ⌘.
+- Menu commands aren't in the harness. Test them on the app itself with `CGEvent.postToPid`, which reaches a background instance without touching the frontmost app.
+- Glass and sidebar vibrancy don't render this way.
+
 ## Project setup gotchas
 
 - The target uses file-system-synchronized groups: any file under `Silver/` is compiled automatically, with no `project.pbxproj` edit needed.
 - Swift 5 language mode with `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` and approachable concurrency. Everything is main-actor unless marked `nonisolated`, and `nonisolated async` functions run on the caller's actor. Heavy work therefore goes through `Task.detached` or the `PreviewRenderer` actor, and value types used off the main actor are declared `nonisolated`.
+- A `MagnifyGesture` on the same view as a `DragGesture` holds back the drag's updates until the mouse is released, so a pan jumps at the end instead of following the pointer. The zoomed view's pinch is therefore on the scroll view, not on the content with the pan.
 - Loupe cursors use the `cursor(_:)` modifier in `LoupeView.swift`, not `pointerStyle` alone. `pointerStyle` misses state changes under a still pointer, changes during a drag, and exits into the sidebar and toolbar, which set no cursor of their own.
 - App Sandbox: user-selected files are read-write (needed for sidecars and export). `Silver.entitlements` adds app-scoped security bookmarks and is merged with the build-setting entitlements.
 
@@ -79,8 +88,22 @@ JPEG sources use `CITemperatureAndTint` for white balance and the same kernel wi
 - The active photo's thumbnail is refreshed from the preview render once edits pause (no newer render pending), not on every step of a slider drag.
 - Export runs jobs sequentially in `Task.detached`. It writes sRGB JPEGs with a whitelisted subset of the original EXIF/GPS/TIFF metadata and orientation 1.
 
+**UI conventions.** Shared controls live in `Views/Controls.swift`.
+- The chrome stays neutral so it doesn't compete with the photo. The accent color marks selection and primary actions; values are drawn in white.
+- Adjustments use `TrackSlider`, not `Slider`. Its fill starts at the default value, so an untouched adjustment shows no fill and a changed one shows how far it moved. White balance tracks show their color scale instead of a fill.
+- Inspector sections match the Copy Adjustments groups (Light, White Balance, Color, Crop). Each shows a reset button only when it has changes.
+- Floating labels over the photo use `canvasLabel()` (glass capsule).
+
+**Interactions.** Where Lightroom and Photos agree, Silver follows them.
+- Every keyboard shortcut is a menu command, so it shows in the menu bar and works regardless of focus. Commands that toggle ignore key auto-repeat (`ignoringRepeats`).
+- Paste, Reset and Export commands act on all selected photos, and their labels give the count when it's more than one. In the inspector, Paste does the same, while Reset and the section resets act on the photo shown.
+- Context-menu commands act on the selection when the clicked photo is in it, otherwise on just that photo (`contextTargets`), without changing the selection.
+- `\` toggles the original on a tap and shows it only while held on a longer press. A key-up monitor in `AppDelegate` ends the hold, since menu commands only see key presses.
+- Values can be typed after clicking them in the inspector. While a field has the keyboard, `valueEditor` is set and single-key shortcuts and the crop's Return/Escape buttons are off.
+- In the crop editor, dragging outside the crop rotates, ⌘-drag draws a level line, ⇧ keeps proportions, ⌥ resizes around the center, and double-clicking inside finishes. Modifiers come from `NSApp.currentEvent`, the event being handled, not the live keyboard state.
+
 ## Decisions to preserve
 
 - RAW decoding uses Apple's camera profile (the default `CIRAWFilter` decoder version). The DNG-embedded profile (`*.dng` decoder versions, e.g. Leica "PROFILE M11") was tried and reverted: it was 3–5× slower to open and export.
 - Responsiveness matters more than matching Lightroom exactly. Benchmark rendering changes old-vs-new, alternating the order to avoid cold-file-cache bias, and report the cost.
-- Single-key menu shortcuts (←/→, G, E, R, `\`) are disabled while a sheet is shown.
+- Single-key menu shortcuts (arrows, Space, G, E, R, X, Z, `\`) are disabled while a sheet is shown or a value is being typed (`allowsSingleKeyShortcuts`).

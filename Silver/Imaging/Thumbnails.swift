@@ -47,7 +47,8 @@ nonisolated struct PhotoMetadata: Sendable {
     var pixelSize: CGSize?
     var camera: String?
     var lens: String?
-    var exposureSummary: String?
+    /// Focal length, aperture, shutter speed and ISO, as far as known.
+    var exposure: [String] = []
     var captureDate: Date?
 
     static func load(url: URL) -> PhotoMetadata {
@@ -85,7 +86,7 @@ nonisolated struct PhotoMetadata: Sendable {
         if let iso = (exif[kCGImagePropertyExifISOSpeedRatings] as? [Int])?.first {
             parts.append("ISO \(iso)")
         }
-        result.exposureSummary = parts.isEmpty ? nil : parts.joined(separator: "  ·  ")
+        result.exposure = parts
 
         if let dateString = exif[kCGImagePropertyExifDateTimeOriginal] as? String {
             let formatter = DateFormatter()

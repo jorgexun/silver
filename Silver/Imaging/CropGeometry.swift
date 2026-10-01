@@ -1,6 +1,8 @@
 import CoreGraphics
 import Foundation
 
+nonisolated enum CropOrientation { case landscape, portrait, square }
+
 /// Geometry helpers for crop rectangles living in the straightened image frame.
 ///
 /// The straightened frame has the same size as the oriented image (`imageSize`), with the image rotated
@@ -91,6 +93,13 @@ nonisolated enum CropGeometry {
     /// Pixel aspect ratio (width / height) of a normalized rect.
     static func pixelAspect(of rect: CropRect, imageSize: CGSize) -> Double {
         (rect.width * Double(imageSize.width)) / max(rect.height * Double(imageSize.height), 1e-9)
+    }
+
+    /// Whether a crop is wider than tall, taller than wide, or square to within rounding.
+    static func orientation(of rect: CropRect, imageSize: CGSize) -> CropOrientation {
+        let aspect = pixelAspect(of: rect, imageSize: imageSize)
+        if abs(aspect - 1) < 0.005 { return .square }
+        return aspect > 1 ? .landscape : .portrait
     }
 
     /// Target pixel aspect for a constraint, following the orientation of `rect`.

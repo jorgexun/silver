@@ -2,9 +2,15 @@ import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let library = LibraryModel()
+    private var keyUpMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         library.restoreSession()
+        // Menu commands only see key presses; releasing a held \ ends a look at the original.
+        keyUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyUp) { [library] event in
+            if event.charactersIgnoringModifiers == "\\" { library.endOriginalPeek() }
+            return event
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -39,6 +45,10 @@ struct SilverCommands: Commands {
     let library: LibraryModel
 
     var body: some Commands {
+        let targetPhotos = library.targetPhotos
+        let targets = targetPhotos.count
+        let singleKeys = library.allowsSingleKeyShortcuts
+
         CommandGroup(replacing: .newItem) {
             Button("Add Folder…") { library.presentAddFolderPanel() }
                 .keyboardShortcut("o")
@@ -53,21 +63,21 @@ struct SilverCommands: Commands {
         }
         CommandGroup(after: .newItem) {
             Divider()
-            Button("Export JPEG…") { library.exportTargets() }
+            Button(targets > 1 ? "Export \(targets) Photos…" : "Export Photo…") { library.exportPhotos() }
                 .keyboardShortcut("e", modifiers: [.command, .shift])
-                .disabled(library.targetPhotos.isEmpty)
+                .disabled(targets == 0)
             Button("Show in Finder") { library.revealActiveInFinder() }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
-                .disabled(library.targetPhotos.isEmpty)
+                .disabled(targets == 0)
         }
 
         CommandGroup(replacing: .undoRedo) {
             Button(library.undoActionName.map { "Undo \($0)" } ?? "Undo") { library.undo() }
                 .keyboardShortcut("z")
-                .disabled(!library.canUndo)
+                .disabled(!library.canUndo || library.isEditingValue)
             Button(library.redoActionName.map { "Redo \($0)" } ?? "Redo") { library.redo() }
                 .keyboardShortcut("z", modifiers: [.command, .shift])
-                .disabled(!library.canRedo)
+                .disabled(!library.canRedo || library.isEditingValue)
         }
 
         CommandGroup(replacing: .pasteboard) {
@@ -77,56 +87,96 @@ struct SilverCommands: Commands {
             Button("Copy Adjustments…") { library.isShowingCopyOptions = true }
                 .keyboardShortcut("c", modifiers: [.command, .shift, .option])
                 .disabled(library.activePhoto == nil)
-            Button("Paste Adjustments") { library.pasteAdjustments(toSelected: false) }
+            // Pastes onto every selected photo, as Paste Edits does in Photos.
+            Button(targets > 1 ? "Paste Adjustments to \(targets) Photos" : "Paste Adjustments") { library.pasteAdjustments() }
                 .keyboardShortcut("v", modifiers: [.command, .shift])
                 .disabled(!library.canPaste)
-            Button("Paste to Selected") { library.pasteAdjustments(toSelected: true) }
-                .keyboardShortcut("v", modifiers: [.command, .shift, .option])
-                .disabled(!library.canPaste || library.selection.count < 1)
             Divider()
             Button("Select All") { library.selectAll() }
                 .keyboardShortcut("a")
-                .disabled(library.photos.isEmpty)
+                .disabled(library.photos.isEmpty || library.isEditingValue)
             Button("Deselect All") { library.deselectAll() }
                 .keyboardShortcut("d")
-                .disabled(library.selection.count < 2)
+                .disabled(library.selection.count < 2 || library.isEditingValue)
+            Menu("Extend Selection") {
+                Button("To Previous Photo") { library.extendSelection(by: -1) }
+                    .keyboardShortcut(.leftArrow, modifiers: .shift)
+                    .disabled(!singleKeys)
+                Button("To Next Photo") { library.extendSelection(by: 1) }
+                    .keyboardShortcut(.rightArrow, modifiers: .shift)
+                    .disabled(!singleKeys)
+                Button("To Photo Above") { library.extendSelection(by: -library.gridColumns) }
+                    .keyboardShortcut(.upArrow, modifiers: .shift)
+                    .disabled(!singleKeys || library.viewMode != .grid)
+                Button("To Photo Below") { library.extendSelection(by: library.gridColumns) }
+                    .keyboardShortcut(.downArrow, modifiers: .shift)
+                    .disabled(!singleKeys || library.viewMode != .grid)
+            }
+            .disabled(library.photos.isEmpty)
         }
 
         CommandMenu("Photo") {
             Button("Previous Photo") { library.selectPrevious() }
                 .keyboardShortcut(.leftArrow, modifiers: [])
-                .disabled(library.photos.isEmpty || library.isShowingSheet)
+                .disabled(library.photos.isEmpty || !singleKeys)
             Button("Next Photo") { library.selectNext() }
                 .keyboardShortcut(.rightArrow, modifiers: [])
-                .disabled(library.photos.isEmpty || library.isShowingSheet)
+                .disabled(library.photos.isEmpty || !singleKeys)
+            Button("Photo Above") { library.selectAbove() }
+                .keyboardShortcut(.upArrow, modifiers: [])
+                .disabled(library.photos.isEmpty || library.viewMode != .grid || !singleKeys)
+            Button("Photo Below") { library.selectBelow() }
+                .keyboardShortcut(.downArrow, modifiers: [])
+                .disabled(library.photos.isEmpty || library.viewMode != .grid || !singleKeys)
             Divider()
-            Button("Crop & Straighten") { library.toggleCrop() }
+            Button("Crop & Straighten") { ignoringRepeats { library.toggleCrop() } }
                 .keyboardShortcut("r", modifiers: [])
-                .disabled(library.activePhoto == nil || library.isShowingSheet)
-            Button("Show Original") { library.showOriginal.toggle() }
+                .disabled(library.activePhoto == nil || !singleKeys)
+            Button("Switch Crop Orientation") { ignoringRepeats { library.rotateCropOrientation() } }
+                .keyboardShortcut("x", modifiers: [])
+                .disabled(!library.isCropping || !singleKeys)
+            Button("Show Original") { ignoringRepeats { library.toggleOriginal() } }
                 .keyboardShortcut("\\", modifiers: [])
-                .disabled(library.activePhoto == nil || library.isCropping || library.viewMode != .loupe || library.isShowingSheet)
+                .disabled(library.activePhoto == nil || library.isCropping || library.viewMode != .loupe || !singleKeys)
             Divider()
-            Button("Reset Adjustments") { library.resetAdjustments() }
+            Button(targets > 1 ? "Reset \(targets) Photos" : "Reset Adjustments") { library.resetAdjustments() }
                 .keyboardShortcut("r", modifiers: [.command, .shift, .option])
-                .disabled(library.targetPhotos.isEmpty)
+                .disabled(targetPhotos.allSatisfy { !$0.isEdited })
         }
 
         CommandGroup(before: .sidebar) {
             Button("Grid") { library.viewMode = .grid }
                 .keyboardShortcut("g", modifiers: [])
-                .disabled(library.photos.isEmpty || library.isShowingSheet)
+                .disabled(library.photos.isEmpty || !singleKeys)
             Button("Loupe") { library.viewMode = .loupe }
                 .keyboardShortcut("e", modifiers: [])
-                .disabled(library.activePhoto == nil || library.isShowingSheet)
-            Button(library.zoom == nil ? "Zoom to 100%" : "Zoom to Fit") { library.toggleZoom() }
+                .disabled(library.activePhoto == nil || !singleKeys)
+            Button(library.viewMode == .grid ? "Open Photo" : "Back to Grid") { ignoringRepeats { library.toggleLoupe() } }
+                .keyboardShortcut(.space, modifiers: [])
+                .disabled(library.activePhoto == nil || library.isCropping || !singleKeys)
+            Divider()
+            Button(library.zoom == nil ? "Zoom to 100%" : "Zoom to Fit") { ignoringRepeats { library.toggleZoom() } }
                 .keyboardShortcut("z", modifiers: [])
-                .disabled(library.activePhoto == nil || library.isCropping || library.isShowingSheet)
+                .disabled(library.activePhoto == nil || library.isCropping || !singleKeys)
+            Button("Zoom In") { library.zoomIn() }
+                .keyboardShortcut("+")
+                .disabled(!library.canZoomIn || library.isShowingSheet)
+            Button("Zoom Out") { library.zoomOut() }
+                .keyboardShortcut("-")
+                .disabled(!library.canZoomOut || library.isShowingSheet)
+            Divider()
             Button(library.isInspectorPresented ? "Hide Adjustments" : "Show Adjustments") {
                 library.isInspectorPresented.toggle()
             }
             .keyboardShortcut("i", modifiers: [.command, .option])
             Divider()
         }
+    }
+
+    /// Runs `action` for a key press but not for its auto-repeats, so holding the key of a toggle
+    /// doesn't flip it back and forth.
+    private func ignoringRepeats(_ action: () -> Void) {
+        if let event = NSApp.currentEvent, event.type == .keyDown, event.isARepeat { return }
+        action()
     }
 }
