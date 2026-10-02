@@ -46,11 +46,16 @@ nonisolated enum ExportError: LocalizedError {
 nonisolated enum Exporter {
     private static let context = CIContext(options: [.name: "Silver.Export", .cacheIntermediates: false])
 
+    /// The name an export of `source` starts from.
+    static func fileName(for source: URL) -> String {
+        source.deletingPathExtension().lastPathComponent + ".jpg"
+    }
+
     /// Chooses `name.jpg` in `folder`, avoiding names already used in this batch and,
     /// unless overwriting, existing files.
     static func destination(for source: URL, in folder: URL, policy: ExistingFilePolicy, reserved: Set<String>) -> URL {
         let base = source.deletingPathExtension().lastPathComponent
-        var candidate = base + ".jpg"
+        var candidate = fileName(for: source)
         var index = 1
         func taken(_ name: String) -> Bool {
             if reserved.contains(name.lowercased()) { return true }

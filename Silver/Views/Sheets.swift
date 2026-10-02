@@ -56,7 +56,7 @@ struct ExportSheet: View {
                             range: 0.5...1,
                             origin: 0.5
                         )
-                        Text("\(Int((model.quality * 100).rounded()))")
+                        Text("\(model.qualityPercent)")
                             .monospacedDigit()
                             .frame(width: 26, alignment: .trailing)
                     }
@@ -131,7 +131,7 @@ struct ExportSheet: View {
 
 /// A folder path with the home folder shown as “~”. The sandbox's home is the app container, so
 /// the user's actual home folder is looked up.
-private func displayPath(of url: URL) -> String {
+func displayPath(of url: URL) -> String {
     let path = url.path(percentEncoded: false)
     guard let home = userHomePath, path == home || path.hasPrefix(home + "/") else { return path }
     return "~" + path.dropFirst(home.count)

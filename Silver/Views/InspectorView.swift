@@ -5,7 +5,9 @@ struct InspectorView: View {
 
     // Only the subviews read `photo.settings`, which changes on every step of a slider drag.
     var body: some View {
-        if let photo = library.activePhoto {
+        if library.viewMode == .grid, library.selection.count > 1 {
+            SelectionInspector()
+        } else if let photo = library.activePhoto {
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
                     PhotoInfoHeader(photo: photo)

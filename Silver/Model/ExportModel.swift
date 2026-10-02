@@ -37,6 +37,9 @@ final class ExportModel {
         didSet { UserDefaults.standard.set(existingFilePolicy.rawValue, forKey: "ExportExistingFilePolicy") }
     }
     private(set) var outputFolder: URL?
+    /// Lowercased names of the files in `outputFolder`, for warning before an export that some
+    /// names are taken. Read by `refreshExistingNames()`.
+    private(set) var existingNames: Set<String> = []
 
     init() {
         let defaults = UserDefaults.standard
@@ -45,6 +48,8 @@ final class ExportModel {
         existingFilePolicy = defaults.string(forKey: "ExportExistingFilePolicy").flatMap { ExistingFilePolicy(rawValue: $0) } ?? .keepBoth
         outputFolder = Bookmarks.resolve(forKey: Bookmarks.exportFolderKey)
     }
+
+    var qualityPercent: Int { Int((quality * 100).rounded()) }
 
     var isExporting: Bool {
         if case .exporting = phase { return true }
@@ -103,7 +108,26 @@ final class ExportModel {
             }
             phase = .finished(ExportSummary(folder: folder, exported: exported, failures: failures, wasCancelled: Task.isCancelled))
             task = nil
+            await refreshExistingNames()
         }
+    }
+
+    /// Lists the output folder once, so checking a selection against it needs no file access.
+    func refreshExistingNames() async {
+        guard let folder = outputFolder else {
+            existingNames = []
+            return
+        }
+        let names = await Task.detached(priority: .utility) {
+            let files = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+            return Set(files.map { $0.lowercased() })
+        }.value
+        if outputFolder == folder { existingNames = names }
+    }
+
+    /// How many of `sources` would be exported to a name already in the output folder.
+    func existingCount(for sources: [URL]) -> Int {
+        sources.count { existingNames.contains(Exporter.fileName(for: $0).lowercased()) }
     }
 
     func cancel() {

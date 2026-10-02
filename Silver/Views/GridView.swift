@@ -16,10 +16,12 @@ struct GridView: View {
             ScrollView {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: size, maximum: size * 1.6), spacing: Self.spacing)], spacing: Self.spacing) {
                     ForEach(library.photos) { photo in
+                        let isSelected = library.selection.contains(photo.id)
                         ThumbnailCell(
                             photo: photo,
-                            isSelected: library.selection.contains(photo.id),
-                            isActive: library.activeID == photo.id
+                            isSelected: isSelected,
+                            // With nothing selected, the active photo isn't marked.
+                            isActive: isSelected && library.activeID == photo.id
                         )
                         .frame(height: size)
                         .id(photo.id)

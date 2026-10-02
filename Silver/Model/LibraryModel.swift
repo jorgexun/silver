@@ -56,6 +56,8 @@ final class LibraryModel {
     // MARK: Selection
 
     private(set) var selection: Set<Photo.ID> = []
+    /// The photo being edited. With nothing selected in the grid, it stays set as the photo the
+    /// arrow keys and the loupe go on from, but `activePhoto` is nil.
     private(set) var activeID: Photo.ID?
     private var anchorID: Photo.ID?
 
@@ -65,6 +67,8 @@ final class LibraryModel {
         didSet {
             guard viewMode != oldValue else { return }
             if viewMode == .loupe {
+                // The loupe always shows a photo.
+                if selection.isEmpty, let photo = focusPhoto { select(photo) }
                 loadPlaceholder()
                 requestPreview()
             } else {
@@ -205,7 +209,11 @@ final class LibraryModel {
 
     // MARK: - Derived state
 
-    var activePhoto: Photo? { activeID.flatMap { photosByID[$0] } }
+    /// The photo being edited; nil when nothing is selected.
+    var activePhoto: Photo? { selection.isEmpty ? nil : focusPhoto }
+
+    /// The active photo, also while nothing is selected.
+    private var focusPhoto: Photo? { activeID.flatMap { photosByID[$0] } }
 
     var selectedPhotos: [Photo] { photos.filter { selection.contains($0.id) } }
 
@@ -309,6 +317,7 @@ final class LibraryModel {
         UserDefaults.standard.set(url.path, forKey: Self.selectedFolderKey)
 
         let previousActiveID = keepState ? activeID : nil
+        let keepsSelection = keepState && !selection.isEmpty
         resetFolderState()
         folderURL = url
         isScanning = true
@@ -322,8 +331,9 @@ final class LibraryModel {
             photosByID = Dictionary(uniqueKeysWithValues: photos.map { ($0.id, $0) })
             isScanning = false
 
-            if let first = previousActiveID.flatMap({ photosByID[$0] }) ?? photos.first {
-                select(first)
+            // A folder opens with nothing selected, as in Finder; reloading keeps the active photo.
+            if let photo = previousActiveID.flatMap({ photosByID[$0] }) ?? photos.first {
+                if keepsSelection { select(photo) } else { setActive(photo.id) }
             }
             // Embedded previews first; edited photos are re-queued for a rendered thumbnail.
             enqueueThumbnails(photos)
@@ -380,11 +390,8 @@ final class LibraryModel {
     /// Handles a click on a thumbnail, honoring ⌘ and ⇧ modifiers.
     func click(_ photo: Photo, modifiers: NSEvent.ModifierFlags) {
         if modifiers.contains(.command) {
-            if selection.contains(photo.id), selection.count > 1 {
-                selection.remove(photo.id)
-                if activeID == photo.id, let next = selectedPhotos.first {
-                    setActive(next.id)
-                }
+            if selection.contains(photo.id) {
+                deselect(photo)
             } else {
                 selection.insert(photo.id)
                 setActive(photo.id)
@@ -420,10 +427,29 @@ final class LibraryModel {
         if activeID == nil, let first = photos.first { setActive(first.id) }
     }
 
-    /// Keeps only the active photo selected.
+    /// The grid can have nothing selected; the loupe always has its photo.
+    private var minimumSelection: Int { viewMode == .grid ? 0 : 1 }
+
+    var canDeselectAll: Bool { selection.count > minimumSelection }
+
+    /// Clears the selection, as in Finder and Photos. The loupe keeps its photo selected.
     func deselectAll() {
-        selection = activeID.map { [$0] } ?? []
-        anchorID = activeID
+        guard canDeselectAll else { return }
+        if viewMode == .grid {
+            selection = []
+            anchorID = nil
+        } else if let photo = activePhoto {
+            select(photo)
+        }
+    }
+
+    /// Removes `photo` from the selection. If it was the active photo, another selected photo
+    /// takes its place.
+    func deselect(_ photo: Photo) {
+        guard selection.contains(photo.id), selection.count > minimumSelection else { return }
+        selection.remove(photo.id)
+        if anchorID == photo.id { anchorID = nil }
+        if activeID == photo.id, let next = selectedPhotos.first { setActive(next.id) }
     }
 
     func selectNext() { step(1) }
@@ -436,6 +462,8 @@ final class LibraryModel {
 
     private func step(_ offset: Int, extend: Bool = false) {
         guard !photos.isEmpty else { return }
+        // With nothing selected, the arrow keys first select the photo they'd go on from.
+        if selection.isEmpty, let photo = focusPhoto { return select(photo) }
         let current = activeIndex
         var index = current.map { $0 + offset } ?? 0
         // A row step past the first or last row stops at the first or last photo, as in Photos.
@@ -536,7 +564,9 @@ final class LibraryModel {
     private func didChangeSettings(of changed: [Photo]) {
         for photo in changed {
             scheduleSave(photo)
-            if photo.id == activeID {
+            // The active photo's thumbnail comes from its preview, which isn't rendered while
+            // nothing is selected.
+            if photo === activePhoto {
                 requestPreview(forThumbnail: true)
             } else {
                 enqueueThumbnails([photo])

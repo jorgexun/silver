@@ -40,6 +40,12 @@ final class Photo: Identifiable {
         return nil
     }
 
+    /// Pixel size of an exported JPEG: `fullSize`, or before the photo has been rendered, the
+    /// file's size through the crop.
+    var exportSize: CGSize? {
+        fullSize ?? metadata?.pixelSize.map { ImagePipeline.outputSize(settings, imageSize: $0) }
+    }
+
     private func updateFullSize() {
         let size = nativeSize.map { ImagePipeline.outputSize(settings, imageSize: $0) }
         if size != fullSize { fullSize = size }

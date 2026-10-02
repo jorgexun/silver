@@ -118,7 +118,7 @@ struct SilverCommands: Commands {
                     .disabled(library.photos.isEmpty || library.isEditingValue)
                 Button("Deselect All") { library.deselectAll() }
                     .keyboardShortcut("d")
-                    .disabled(library.selection.count < 2 || library.isEditingValue)
+                    .disabled(!library.canDeselectAll || library.isEditingValue)
                 Menu("Extend Selection") {
                     Button("To Previous Photo") { library.extendSelection(by: -1) }
                         .keyboardShortcut(.leftArrow, modifiers: .shift)
@@ -175,12 +175,13 @@ struct SilverCommands: Commands {
                 Button("Grid") { library.viewMode = .grid }
                     .keyboardShortcut("g", modifiers: [])
                     .disabled(library.photos.isEmpty || !singleKeys)
+                // With nothing selected, these open the photo last selected.
                 Button("Loupe") { library.viewMode = .loupe }
                     .keyboardShortcut("e", modifiers: [])
-                    .disabled(library.activePhoto == nil || !singleKeys)
+                    .disabled(library.photos.isEmpty || !singleKeys)
                 Button(library.viewMode == .grid ? "Open Photo" : "Back to Grid") { ignoringRepeats { library.toggleLoupe() } }
                     .keyboardShortcut(.space, modifiers: [])
-                    .disabled(library.activePhoto == nil || library.isCropping || !singleKeys)
+                    .disabled(library.photos.isEmpty || library.isCropping || !singleKeys)
                 Divider()
                 Button(library.zoom == nil ? "Zoom to 100%" : "Zoom to Fit") { ignoringRepeats { library.toggleZoom() } }
                     .keyboardShortcut("z", modifiers: [])
