@@ -103,17 +103,17 @@ JPEG sources use `CITemperatureAndTint` for white balance and the same kernel wi
 **UI conventions.** Shared controls live in `Views/Controls.swift`.
 - The chrome stays neutral so it doesn't compete with the photo. The accent color marks selection and primary actions; values are drawn in white.
 - Adjustments use `TrackSlider`, not `Slider`. Its fill starts at the default value, so an untouched adjustment shows no fill and a changed one shows how far it moved. White balance tracks show their color scale instead of a fill.
-- Inspector sections match the Copy Adjustments groups (Light, White Balance, Color, Crop). Each shows a reset button only when it has changes.
+- Inspector sections match the Copy Adjustments groups (Crop, Light, White Balance, Color). Each adjustment, and the crop, shows a reset icon after its name only when it has changed; section headers have none. The photo's Reset is in the header next to its name. Copy and Paste are menu commands only (⌘C, ⌘V), with no inspector buttons.
 - Floating labels over the photo use `canvasLabel()` (glass capsule).
 
 **Interactions.** Where Lightroom and Photos agree, Silver follows them.
 - Every keyboard shortcut is a menu command, so it shows in the menu bar and works regardless of focus. Commands that toggle ignore key auto-repeat (`ignoringRepeats`).
-- Paste, Reset and Export commands act on all selected photos, and their labels give the count when it's more than one. In the inspector, Paste does the same, while Reset and the section resets act on the photo shown.
+- Paste, Reset and Export commands act on all selected photos, and their labels give the count when it's more than one. In the inspector, Reset and the reset icons act on the photo shown.
 - Context-menu commands act on the selection when the clicked photo is in it, otherwise on just that photo (`contextTargets`), without changing the selection.
 - In the loupe, a click toggles 100% and a double-click returns to the grid. The click waits 0.25 s for a second click itself (`PreviewCanvas.click`), not via `onTapGesture(count: 2)`, which holds a single tap back about 0.35 s. A slower double-click still reaches the grid by its `clickCount`, after the first click has acted.
 - `\` toggles the original on a tap and shows it only while held on a longer press. A key-up monitor in `AppDelegate` ends the hold, since menu commands only see key presses.
-- Values can be typed after clicking them in the inspector. While a field has the keyboard, `valueEditor` is set and single-key shortcuts and the crop's Return/Escape buttons are off.
-- In the crop editor, dragging outside the crop rotates, ⌘-drag draws a level line, ⇧ keeps proportions, ⌥ resizes around the center, and double-clicking inside finishes. Modifiers come from `NSApp.currentEvent`, the event being handled, not the live keyboard state.
+- Values can be typed after clicking them in the inspector. While a field has the keyboard, `valueEditor` is set and single-key shortcuts and the crop's Return/Escape buttons are off, and ⌘C/⌘V copy and paste the field's text instead of adjustments.
+- In the crop editor, dragging outside the crop rotates (the cursor curves around the side or corner of the crop the pointer is at), ⌘-drag draws a level line, ⇧ keeps proportions, ⌥ resizes around the center, and double-clicking inside finishes. Modifiers come from `NSApp.currentEvent`, the event being handled, not the live keyboard state.
 
 ## Decisions to preserve
 

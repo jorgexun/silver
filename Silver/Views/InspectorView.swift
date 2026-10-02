@@ -11,51 +11,19 @@ struct InspectorView: View {
                     PhotoInfoHeader(photo: photo)
                     if library.isCropping {
                         CropSection(photo: photo)
-                    }
-                    // The same groups as Copy Adjustments… offers.
-                    AdjustmentSection(title: "Light", groups: .light, adjustments: Adjustment.light, photo: photo)
-                    AdjustmentSection(title: "White Balance", groups: .whiteBalance, adjustments: Adjustment.whiteBalance, photo: photo)
-                    AdjustmentSection(title: "Color", groups: .color, adjustments: Adjustment.color, photo: photo)
-                    if !library.isCropping {
+                    } else {
                         GeometrySection(photo: photo)
                     }
+                    // The same groups as Copy Adjustments… offers.
+                    AdjustmentSection(title: "Light", adjustments: Adjustment.light, photo: photo)
+                    AdjustmentSection(title: "White Balance", adjustments: Adjustment.whiteBalance, photo: photo)
+                    AdjustmentSection(title: "Color", adjustments: Adjustment.color, photo: photo)
                 }
                 .padding(16)
-            }
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                InspectorFooter()
             }
         } else {
             ContentUnavailableView("No Photo Selected", systemImage: "slider.horizontal.3")
         }
-    }
-}
-
-/// Copy takes the photo shown and Paste goes to every selected photo, saying how many. Reset, like
-/// the section resets, is for the photo shown; resetting several is in the Photo menu.
-private struct InspectorFooter: View {
-    @Environment(LibraryModel.self) private var library
-
-    var body: some View {
-        let count = library.targetPhotos.count
-        VStack(spacing: 8) {
-            Divider()
-            HStack(spacing: 8) {
-                Button("Copy") { library.copyAdjustments() }
-                    .help("Copy Adjustments (⇧⌘C)")
-                Button(count > 1 ? "Paste to \(count)" : "Paste") { library.pasteAdjustments() }
-                    .disabled(!library.canPaste)
-                    .help(count > 1 ? "Paste Adjustments to \(count) Photos (⇧⌘V)" : "Paste Adjustments (⇧⌘V)")
-                Spacer()
-                Button("Reset") { library.resetActive(.all, actionName: "Reset Adjustments") }
-                    .disabled(library.activePhoto?.isEdited != true)
-                    .help("Reset This Photo's Adjustments")
-            }
-        }
-        .controlSize(.regular)
-        .padding(.horizontal, 16)
-        .padding(.bottom, 12)
-        .background(.bar)
     }
 }
 
@@ -88,17 +56,13 @@ private struct Adjustment {
 }
 
 private struct AdjustmentSection: View {
-    @Environment(LibraryModel.self) private var library
     let title: String
-    /// The settings reset by the section's reset button.
-    let groups: AdjustmentGroups
     let adjustments: [Adjustment]
     let photo: Photo
 
     var body: some View {
         let settings = photo.settings
-        let isDefault = settings.merging(groups, from: .default) == settings
-        InspectorSection(title, onReset: isDefault ? nil : { library.resetActive(groups, actionName: "Reset \(title)") }) {
+        InspectorSection(title) {
             ForEach(adjustments, id: \.keyPath) { adjustment in
                 AdjustmentRow(adjustment: adjustment, value: settings[keyPath: adjustment.keyPath])
                     .equatable()
@@ -149,12 +113,15 @@ private struct GeometrySection: View {
 
     var body: some View {
         let settings = photo.settings
-        InspectorSection("Crop", onReset: settings.hasGeometry ? { library.resetActive(.geometry, actionName: "Reset Crop") } : nil) {
+        InspectorSection("Crop") {
             HStack {
                 Text(summary(settings))
                     .foregroundStyle(.secondary)
+                if settings.hasGeometry {
+                    ResetButton(title: "Crop") { library.resetActive(.geometry, actionName: "Reset Crop") }
+                }
                 Spacer()
-                Button("Crop & Straighten") { library.beginCrop() }
+                Button("Crop") { library.beginCrop() }
                     .help("Crop & Straighten (R)")
             }
         }
@@ -171,40 +138,40 @@ private struct GeometrySection: View {
 
 struct InspectorSection<Content: View>: View {
     let title: String
-    /// Shows a reset button in the header; nil when there's nothing to reset.
-    let onReset: (() -> Void)?
     @ViewBuilder let content: Content
 
-    init(_ title: String, onReset: (() -> Void)? = nil, @ViewBuilder content: () -> Content) {
+    init(_ title: String, @ViewBuilder content: () -> Content) {
         self.title = title
-        self.onReset = onReset
         self.content = content()
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text(title.uppercased())
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                // Hidden rather than removed, so the header keeps its height.
-                Button("Reset \(title)", systemImage: "arrow.counterclockwise") { onReset?() }
-                    .labelStyle(.iconOnly)
-                    .buttonStyle(.borderless)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .help("Reset \(title)")
-                    .opacity(onReset == nil ? 0 : 1)
-                    .disabled(onReset == nil)
-            }
+            Text(title.uppercased())
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
             content
         }
     }
 }
 
-/// A named slider with its value, as in Lightroom: double-clicking the name or the slider
-/// resets it, and clicking the value lets you type one.
+/// A small reset icon, shown after the name of something that has changed.
+private struct ResetButton: View {
+    let title: String
+    let action: () -> Void
+
+    var body: some View {
+        Button("Reset \(title)", systemImage: "arrow.counterclockwise", action: action)
+            .labelStyle(.iconOnly)
+            .buttonStyle(.borderless)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .help("Reset \(title)")
+    }
+}
+
+/// A named slider with its value, as in Lightroom: the icon after the name or double-clicking
+/// the slider resets it, and clicking the value lets you type one.
 struct AdjustmentSlider: View {
     let title: String
     @Binding var value: Double
@@ -219,13 +186,12 @@ struct AdjustmentSlider: View {
     var body: some View {
         VStack(spacing: 3) {
             HStack(alignment: .firstTextBaseline) {
-                HStack {
-                    Text(title)
-                    Spacer(minLength: 0)
+                Text(title)
+                    .help("Hold Option while dragging for finer control.")
+                if value != 0 {
+                    ResetButton(title: title, action: onReset)
                 }
-                .contentShape(Rectangle())
-                .onTapGesture(count: 2, perform: onReset)
-                .help("Double-click to reset. Hold Option while dragging for finer control.")
+                Spacer(minLength: 0)
                 ValueField(text: format(value), isDefault: value == 0) { typed in
                     onCommit(min(max(typed, range.lowerBound), range.upperBound))
                 }
@@ -302,6 +268,7 @@ private struct ValueField: View {
 }
 
 private struct PhotoInfoHeader: View {
+    @Environment(LibraryModel.self) private var library
     let photo: Photo
 
     var body: some View {
@@ -312,13 +279,19 @@ private struct PhotoInfoHeader: View {
                         .font(.headline)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Spacer(minLength: 0)
                     Text(photo.isRaw ? "RAW" : "JPEG")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 5)
                         .padding(.vertical, 1)
                         .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 4))
+                        .fixedSize()
+                    Spacer(minLength: 0)
+                    // Resetting several photos is in the Photo menu.
+                    Button("Reset") { library.resetActive(.all, actionName: "Reset Adjustments") }
+                        .controlSize(.small)
+                        .disabled(!photo.isEdited)
+                        .help("Reset This Photo's Adjustments")
                 }
                 if let metadata = photo.metadata {
                     Group {
@@ -372,7 +345,7 @@ private struct CropSection: View {
 
     var body: some View {
         let settings = photo.settings
-        InspectorSection("Crop & Straighten", onReset: settings.hasGeometry ? { library.resetCrop() } : nil) {
+        InspectorSection("Crop & Straighten") {
             AspectRatioGrid(photo: photo)
 
             AdjustmentSlider(
@@ -389,6 +362,9 @@ private struct CropSection: View {
             )
 
             HStack {
+                Button("Reset") { library.resetCrop() }
+                    .disabled(!settings.hasGeometry)
+                    .help("Reset Crop & Straighten")
                 Spacer()
                 // Return and Escape belong to a value being typed.
                 Button("Cancel") { library.cancelCrop() }

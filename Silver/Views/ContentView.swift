@@ -110,12 +110,6 @@ struct ContentView: View {
         }
 
         ToolbarItemGroup(placement: .primaryAction) {
-            Toggle(isOn: Binding(get: { library.isCropping }, set: { _ in library.toggleCrop() })) {
-                Label("Crop", systemImage: "crop")
-            }
-            .help("Crop & Straighten (R)")
-            .disabled(library.activePhoto == nil)
-
             Toggle(isOn: $library.showOriginal) {
                 Label("Show Original", systemImage: "square.split.2x1")
             }

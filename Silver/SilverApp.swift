@@ -81,16 +81,24 @@ struct SilverCommands: Commands {
         }
 
         CommandGroup(replacing: .pasteboard) {
-            Button("Copy Adjustments") { library.copyAdjustments() }
-                .keyboardShortcut("c", modifiers: [.command, .shift])
-                .disabled(library.activePhoto == nil)
-            Button("Copy Adjustments…") { library.isShowingCopyOptions = true }
-                .keyboardShortcut("c", modifiers: [.command, .shift, .option])
-                .disabled(library.activePhoto == nil)
-            // Pastes onto every selected photo, as Paste Edits does in Photos.
-            Button(targets > 1 ? "Paste Adjustments to \(targets) Photos" : "Paste Adjustments") { library.pasteAdjustments() }
-                .keyboardShortcut("v", modifiers: [.command, .shift])
-                .disabled(!library.canPaste)
+            // While a value is being typed, ⌘C and ⌘V copy and paste its text instead.
+            if library.isEditingValue {
+                Button("Copy") { NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil) }
+                    .keyboardShortcut("c")
+                Button("Paste") { NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil) }
+                    .keyboardShortcut("v")
+            } else {
+                Button("Copy Adjustments") { library.copyAdjustments() }
+                    .keyboardShortcut("c")
+                    .disabled(library.activePhoto == nil)
+                Button("Copy Adjustments…") { library.isShowingCopyOptions = true }
+                    .keyboardShortcut("c", modifiers: [.command, .shift, .option])
+                    .disabled(library.activePhoto == nil)
+                // Pastes onto every selected photo, as Paste Edits does in Photos.
+                Button(targets > 1 ? "Paste Adjustments to \(targets) Photos" : "Paste Adjustments") { library.pasteAdjustments() }
+                    .keyboardShortcut("v")
+                    .disabled(!library.canPaste)
+            }
             Divider()
             Button("Select All") { library.selectAll() }
                 .keyboardShortcut("a")

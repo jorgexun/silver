@@ -377,8 +377,10 @@ private final class ScrollTracker {
 }
 
 private enum CanvasCursor: Equatable {
-    case arrow, zoomIn, openHand, closedHand, rotate, crosshair
+    case arrow, zoomIn, openHand, closedHand, crosshair
     case resize(FrameResizePosition)
+    /// Curved around the crop at this side of it.
+    case rotate(FrameResizePosition)
 
     var style: PointerStyle {
         switch self {
@@ -386,7 +388,7 @@ private enum CanvasCursor: Equatable {
         case .zoomIn: .zoomIn
         case .openHand: .grabIdle
         case .closedHand: .grabActive
-        case .rotate: .image(Image(nsImage: rotateCursorImage), hotSpot: .center)
+        case .rotate(let side): .image(Image(nsImage: rotateCursorImages[side]!), hotSpot: .center)
         case .crosshair: .rectSelection
         case .resize(let position): .frameResize(position: position)
         }
@@ -398,13 +400,13 @@ private enum CanvasCursor: Equatable {
         case .zoomIn: .zoomIn
         case .openHand: .openHand
         case .closedHand: .closedHand
-        case .rotate: Self.rotateCursor
+        case .rotate(let side): Self.rotateCursors[side]!
         case .crosshair: .crosshair
         case .resize(let position): .frameResize(position: Self.appKitPosition(position), directions: .all)
         }
     }
 
-    private static let rotateCursor = NSCursor(image: rotateCursorImage, hotSpot: NSPoint(x: 12, y: 12))
+    private static let rotateCursors = rotateCursorImages.mapValues { NSCursor(image: $0, hotSpot: NSPoint(x: 12, y: 12)) }
 
     private static func appKitPosition(_ position: FrameResizePosition) -> NSCursor.FrameResizePosition {
         switch position {
@@ -420,40 +422,63 @@ private enum CanvasCursor: Equatable {
     }
 }
 
-/// A curved double arrow for rotating, black on a white outline like the system cursors. There's
-/// no system cursor for it.
-private let rotateCursorImage = NSImage(size: NSSize(width: 24, height: 24), flipped: false) { _ in
-    let center = CGPoint(x: 12, y: 9)
-    let radius: CGFloat = 8
-    let arc = NSBezierPath()
-    arc.appendArc(withCenter: center, radius: radius, startAngle: 25, endAngle: 155)
-    // An arrowhead at each end, pointing on around the circle.
-    let heads = [(degrees: 25.0, turn: -1.0), (degrees: 155.0, turn: 1.0)].map { end in
-        let theta = end.degrees * .pi / 180
-        let point = CGPoint(x: center.x + radius * cos(theta), y: center.y + radius * sin(theta))
-        let along = CGVector(dx: -sin(theta) * end.turn, dy: cos(theta) * end.turn)
-        let across = CGVector(dx: cos(theta), dy: sin(theta))
-        let head = NSBezierPath()
-        head.move(to: CGPoint(x: point.x + along.dx * 4, y: point.y + along.dy * 4))
-        head.line(to: CGPoint(x: point.x + across.dx * 3.5 - along.dx, y: point.y + across.dy * 3.5 - along.dy))
-        head.line(to: CGPoint(x: point.x - across.dx * 3.5 - along.dx, y: point.y - across.dy * 3.5 - along.dy))
-        head.close()
-        return head
+/// Curved double arrows for rotating, black on a white outline like the system cursors. There's
+/// no system cursor for it. Each follows the crop's outline at its side: arched over the top,
+/// bent around a corner, and so on.
+private let rotateCursorImages = Dictionary(uniqueKeysWithValues: FrameResizePosition.allCases.map { side in
+    let degrees: CGFloat = switch side {
+    case .top: 0
+    case .topLeading: 45
+    case .leading: 90
+    case .bottomLeading: 135
+    case .bottom: 180
+    case .bottomTrailing: -135
+    case .trailing: -90
+    case .topTrailing: -45
     }
-    NSColor.white.set()
-    arc.lineWidth = 4
-    arc.stroke()
-    for head in heads {
-        head.lineWidth = 2.5
-        head.lineJoinStyle = .round
-        head.stroke()
-        head.fill()
+    return (side, rotateCursorImage(turnedBy: degrees))
+})
+
+/// The rotate cursor for the top of the crop, turned counterclockwise by `degrees`.
+private func rotateCursorImage(turnedBy degrees: CGFloat) -> NSImage {
+    NSImage(size: NSSize(width: 24, height: 24), flipped: false) { _ in
+        let turn = NSAffineTransform()
+        turn.translateX(by: 12, yBy: 12)
+        turn.rotate(byDegrees: degrees)
+        turn.translateX(by: -12, yBy: -12)
+        turn.concat()
+        let center = CGPoint(x: 12, y: 9)
+        let radius: CGFloat = 8
+        let arc = NSBezierPath()
+        arc.appendArc(withCenter: center, radius: radius, startAngle: 25, endAngle: 155)
+        // An arrowhead at each end, pointing on around the circle.
+        let heads = [(degrees: 25.0, turn: -1.0), (degrees: 155.0, turn: 1.0)].map { end in
+            let theta = end.degrees * .pi / 180
+            let point = CGPoint(x: center.x + radius * cos(theta), y: center.y + radius * sin(theta))
+            let along = CGVector(dx: -sin(theta) * end.turn, dy: cos(theta) * end.turn)
+            let across = CGVector(dx: cos(theta), dy: sin(theta))
+            let head = NSBezierPath()
+            head.move(to: CGPoint(x: point.x + along.dx * 4, y: point.y + along.dy * 4))
+            head.line(to: CGPoint(x: point.x + across.dx * 3.5 - along.dx, y: point.y + across.dy * 3.5 - along.dy))
+            head.line(to: CGPoint(x: point.x - across.dx * 3.5 - along.dx, y: point.y - across.dy * 3.5 - along.dy))
+            head.close()
+            return head
+        }
+        NSColor.white.set()
+        arc.lineWidth = 4
+        arc.stroke()
+        for head in heads {
+            head.lineWidth = 2.5
+            head.lineJoinStyle = .round
+            head.stroke()
+            head.fill()
+        }
+        NSColor.black.set()
+        arc.lineWidth = 1.5
+        arc.stroke()
+        heads.forEach { $0.fill() }
+        return true
     }
-    NSColor.black.set()
-    arc.lineWidth = 1.5
-    arc.stroke()
-    heads.forEach { $0.fill() }
-    return true
 }
 
 extension View {
@@ -569,6 +594,21 @@ private enum CropTarget: Equatable {
             self = .rotate
         }
     }
+
+    /// Which side of `frame` the pointer is on, for the rotate cursor. Inside it, during a drag
+    /// that began outside, the nearest edge.
+    static func side(of point: CGPoint, around frame: CGRect) -> FrameResizePosition {
+        let left = point.x < frame.minX, right = point.x > frame.maxX
+        if point.y < frame.minY { return left ? .topLeading : right ? .topTrailing : .top }
+        if point.y > frame.maxY { return left ? .bottomLeading : right ? .bottomTrailing : .bottom }
+        if left { return .leading }
+        if right { return .trailing }
+        let edges: [(FrameResizePosition, CGFloat)] = [
+            (.top, point.y - frame.minY), (.bottom, frame.maxY - point.y),
+            (.leading, point.x - frame.minX), (.trailing, frame.maxX - point.x),
+        ]
+        return edges.min { $0.1 < $1.1 }!.0
+    }
 }
 
 /// A drag in the crop editor: what it grabbed, and the crop and angle when it began.
@@ -587,6 +627,8 @@ struct CropEditorView: View {
 
     @State private var drag: CropDrag?
     @State private var hover: CropTarget?
+    /// Where the pointer is around the crop, which the rotate cursor follows, also during a drag.
+    @State private var rotateSide: FrameResizePosition = .top
     /// Holding ⌘ turns a drag into drawing a level line.
     @State private var isCommandDown = false
     @State private var levelLine: (start: CGPoint, end: CGPoint)?
@@ -665,6 +707,7 @@ struct CropEditorView: View {
         .onContinuousHover { phase in
             if case .active(let point) = phase {
                 hover = CropTarget(at: point, in: cropFrame)
+                rotateSide = CropTarget.side(of: point, around: cropFrame)
             } else {
                 hover = nil
             }
@@ -683,7 +726,7 @@ struct CropEditorView: View {
         switch drag?.target ?? hover {
         case .move: return drag == nil ? .openHand : .closedHand
         case .resize(let handle): return .resize(handle.resizePosition)
-        case .rotate: return .rotate
+        case .rotate: return .rotate(rotateSide)
         case .level: return .crosshair
         case nil: return .arrow
         }
@@ -754,6 +797,7 @@ struct CropEditorView: View {
                 guard let drag else { return }
                 switch drag.target {
                 case .rotate:
+                    rotateSide = CropTarget.side(of: value.location, around: cropFrame)
                     // The photo turns with the pointer around its center.
                     let turn = remainder(angle(of: value.location, around: center) - drag.pointerAngle, 360)
                     library.setStraighten(drag.straighten + turn)
