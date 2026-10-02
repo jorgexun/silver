@@ -5,13 +5,17 @@ nonisolated struct PreviewResult: @unchecked Sendable {
     let image: CGImage
     /// Size of the developed image before crop, used for crop geometry.
     let baseSize: CGSize
+    /// Oriented full-resolution size of the photo, before crop.
+    let nativeSize: CGSize
 }
 
 nonisolated struct DetailResult: @unchecked Sendable {
-    /// Full-resolution pixels for each requested area, in the same order.
+    /// Pixels for each requested area, in the same order.
     let pieces: [(image: CGImage, rect: CGRect)]
-    /// Size of the full-resolution output (after crop and straighten).
-    let fullSize: CGSize
+    /// Size of the output at the scale rendered, which the pieces' rects are in.
+    let size: CGSize
+    /// Oriented full-resolution size of the photo, before crop.
+    let nativeSize: CGSize
 }
 
 /// Hands a decoded source between the renderer and a prefetch running outside it. Only one side
@@ -72,7 +76,7 @@ actor PreviewRenderer {
         guard let (image, baseSize) = ImagePipeline.render(source, settings: settings, geometry: geometry, context: context),
               let cgImage = ImagePipeline.bitmap(image, from: image.extent, context: context, colorSpace: colorSpace)
         else { return nil }
-        return (PreviewResult(image: cgImage, baseSize: baseSize), image)
+        return (PreviewResult(image: cgImage, baseSize: baseSize, nativeSize: source.nativeSize), image)
     }
 
     /// Thumbnail of the last preview render of `url` with crop and straighten, if it had `settings`.
@@ -86,23 +90,26 @@ actor PreviewRenderer {
         lastRenders.removeAll()
     }
 
-    /// Renders parts of the photo at full resolution, for viewing at 100%. `rects` are in
-    /// full-resolution output pixels with a top-left origin and are clipped to the image; pass
-    /// none to only get the full-resolution size.
-    func renderDetail(url: URL, settings: EditSettings, rects: [CGRect], colorSpace: CGColorSpace) -> DetailResult? {
+    /// Renders parts of the photo for viewing zoomed in: at `scale` times full resolution (at most 1),
+    /// so the visible area costs about as many pixels as the screen shows at any zoom. `rects` are
+    /// in output pixels at that scale with a top-left origin and are clipped to the image; pass
+    /// none to only get the photo's size.
+    func renderDetail(url: URL, settings: EditSettings, scale: CGFloat, rects: [CGRect], colorSpace: CGColorSpace) -> DetailResult? {
         guard let source = source(for: url, maxPixelSize: .infinity) else { return nil }
-        source.ensureLongEdge(.infinity)
+        let nativeSize = source.nativeSize
+        guard !rects.isEmpty else { return DetailResult(pieces: [], size: .zero, nativeSize: nativeSize) }
+        source.ensureLongEdge((max(nativeSize.width, nativeSize.height) * min(scale, 1)).rounded(), exact: true)
         guard let (image, _) = ImagePipeline.render(source, settings: settings, geometry: true, context: context) else { return nil }
         let extent = image.extent
-        let fullSize = extent.size
+        let size = extent.size
         let pieces = rects.compactMap { rect -> (CGImage, CGRect)? in
-            let clipped = rect.integral.intersection(CGRect(origin: .zero, size: fullSize))
+            let clipped = rect.integral.intersection(CGRect(origin: .zero, size: size))
             guard !clipped.isEmpty else { return nil }
             // Top-left origin → Core Image's bottom-left origin.
             let region = CGRect(x: extent.minX + clipped.minX, y: extent.maxY - clipped.maxY, width: clipped.width, height: clipped.height)
             return ImagePipeline.bitmap(image, from: region, context: context, colorSpace: colorSpace).map { ($0, clipped) }
         }
-        return DetailResult(pieces: pieces, fullSize: fullSize)
+        return DetailResult(pieces: pieces, size: size, nativeSize: nativeSize)
     }
 
     private func source(for url: URL, maxPixelSize: CGFloat) -> SourceImage? {

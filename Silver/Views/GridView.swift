@@ -10,77 +10,54 @@ struct GridView: View {
     private static let padding: CGFloat = 16
 
     var body: some View {
-        @Bindable var library = library
         let size = library.thumbnailSize
 
-        VStack(spacing: 0) {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: size, maximum: size * 1.6), spacing: Self.spacing)], spacing: Self.spacing) {
-                        ForEach(library.photos) { photo in
-                            ThumbnailCell(
-                                photo: photo,
-                                isSelected: library.selection.contains(photo.id),
-                                isActive: library.activeID == photo.id
-                            )
-                            .frame(height: size)
-                            .id(photo.id)
-                            .onTapGesture(count: 2) { library.open(photo) }
-                            .simultaneousGesture(TapGesture().onEnded {
-                                library.click(photo, modifiers: NSEvent.modifierFlags)
-                            })
-                            .contextMenu { PhotoContextMenu(photo: photo) }
-                        }
-                    }
-                    .padding(Self.padding)
-                    // Clicking between or below the photos deselects them, as in Finder and Photos.
-                    .frame(maxWidth: .infinity, minHeight: viewport.height, alignment: .top)
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        if NSEvent.modifierFlags.isDisjoint(with: [.command, .shift]) { library.deselectAll() }
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: size, maximum: size * 1.6), spacing: Self.spacing)], spacing: Self.spacing) {
+                    ForEach(library.photos) { photo in
+                        ThumbnailCell(
+                            photo: photo,
+                            isSelected: library.selection.contains(photo.id),
+                            isActive: library.activeID == photo.id
+                        )
+                        .frame(height: size)
+                        .id(photo.id)
+                        .onTapGesture(count: 2) { library.open(photo) }
+                        .simultaneousGesture(TapGesture().onEnded {
+                            library.click(photo, modifiers: NSEvent.modifierFlags)
+                        })
+                        .contextMenu { PhotoContextMenu(photo: photo) }
                     }
                 }
-                .onGeometryChange(for: CGSize.self) { $0.size } action: { viewport = $0 }
-                .onChange(of: columns, initial: true) { library.gridColumns = columns }
-                // Pinching resizes the thumbnails, as in Photos.
-                .simultaneousGesture(
-                    MagnifyGesture()
-                        .onChanged { value in
-                            let start = pinchStartSize ?? library.thumbnailSize
-                            pinchStartSize = start
-                            let sizes = LibraryModel.thumbnailSizes
-                            library.thumbnailSize = min(max(start * value.magnification, sizes.lowerBound), sizes.upperBound)
-                        }
-                        .onEnded { _ in pinchStartSize = nil }
-                )
-                .onAppear {
-                    if let id = library.activeID { proxy.scrollTo(id, anchor: .center) }
-                }
-                .onChange(of: library.activeID) { _, id in
-                    guard let id else { return }
-                    withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(id) }
+                .padding(Self.padding)
+                // Clicking between or below the photos deselects them, as in Finder and Photos.
+                .frame(maxWidth: .infinity, minHeight: viewport.height, alignment: .top)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    if NSEvent.modifierFlags.isDisjoint(with: [.command, .shift]) { library.deselectAll() }
                 }
             }
-
-            Divider()
-            HStack(spacing: 8) {
-                Text(statusText)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Image(systemName: "square.grid.3x3")
-                    .imageScale(.small)
-                    .foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
-                TrackSlider(value: $library.thumbnailSize, range: LibraryModel.thumbnailSizes, origin: LibraryModel.thumbnailSizes.lowerBound)
-                    .frame(width: 120)
-                    .help("Thumbnail Size (⌘+ / ⌘−)")
-                Image(systemName: "square.grid.2x2")
-                    .foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
+            .onGeometryChange(for: CGSize.self) { $0.size } action: { viewport = $0 }
+            .onChange(of: columns, initial: true) { library.gridColumns = columns }
+            // Pinching resizes the thumbnails, as in Photos.
+            .simultaneousGesture(
+                MagnifyGesture()
+                    .onChanged { value in
+                        let start = pinchStartSize ?? library.thumbnailSize
+                        pinchStartSize = start
+                        let sizes = LibraryModel.thumbnailSizes
+                        library.thumbnailSize = min(max(start * value.magnification, sizes.lowerBound), sizes.upperBound)
+                    }
+                    .onEnded { _ in pinchStartSize = nil }
+            )
+            .onAppear {
+                if let id = library.activeID { proxy.scrollTo(id, anchor: .center) }
             }
-            .padding(.horizontal, 12)
-            .frame(height: 30)
+            .onChange(of: library.activeID) { _, id in
+                guard let id else { return }
+                withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(id) }
+            }
         }
         .background(Color.canvas)
     }
@@ -89,15 +66,6 @@ struct GridView: View {
     private var columns: Int {
         let width = viewport.width - Self.padding * 2
         return max(Int((width + Self.spacing) / (library.thumbnailSize + Self.spacing)), 1)
-    }
-
-    private var statusText: String {
-        let count = library.photos.count
-        let edited = library.photos.filter(\.isEdited).count
-        var parts = [count == 1 ? "1 photo" : "\(count) photos"]
-        if library.selection.count > 1 { parts.append("\(library.selection.count) selected") }
-        if edited > 0 { parts.append("\(edited) edited") }
-        return parts.joined(separator: " · ")
     }
 }
 

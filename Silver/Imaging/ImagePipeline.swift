@@ -15,7 +15,7 @@ nonisolated final class SourceImage {
     private let asShotTemperature: Float
     private let asShotTint: Float
     /// Oriented full-resolution size.
-    private let nativeSize: CGSize
+    let nativeSize: CGSize
     /// Long edge the image is currently decoded at.
     private(set) var decodedLongEdge: CGFloat
     /// Local tone coefficients (see `LocalTone`) and the white balance they were computed with.
@@ -52,9 +52,10 @@ nonisolated final class SourceImage {
     }
 
     /// Changes the decode resolution when the current one is too small, or much larger than needed.
-    func ensureLongEdge(_ needed: CGFloat) {
+    /// `exact` also changes it when it's larger at all, so the output has the size asked for.
+    func ensureLongEdge(_ needed: CGFloat, exact: Bool = false) {
         let target = min(needed, max(nativeSize.width, nativeSize.height))
-        if decodedLongEdge < target - 1 || decodedLongEdge > target * 1.5 {
+        if decodedLongEdge < target - 1 || decodedLongEdge > (exact ? target + 1 : target * 1.5) {
             setLongEdge(target)
         }
     }
@@ -200,6 +201,20 @@ nonisolated enum ImagePipeline {
             image = image.transformed(by: transform, highQualityDownsample: true)
         }
 
+        let rect = cropRect(settings, in: extent)
+        return image
+            .cropped(to: rect)
+            .settingAlphaOne(in: rect)
+            .transformed(by: CGAffineTransform(translationX: -rect.minX, y: -rect.minY))
+    }
+
+    /// Size of the output for a developed image of `imageSize`, e.g. at full resolution.
+    static func outputSize(_ settings: EditSettings, imageSize: CGSize) -> CGSize {
+        cropRect(settings, in: CGRect(origin: .zero, size: imageSize)).size
+    }
+
+    /// The area `applyGeometry` crops `extent` to, in Core Image's y-up coordinates.
+    private static func cropRect(_ settings: EditSettings, in extent: CGRect) -> CGRect {
         // No-op for crops made in the crop tool; keeps pasted or hand-edited crops inside the
         // straightened image so the output never has empty corners.
         let crop = CropGeometry.fitted(settings.crop, angle: settings.straighten, imageSize: extent.size)
@@ -208,12 +223,7 @@ nonisolated enum ImagePipeline {
         // Flip y: crop is top-left based, Core Image is bottom-left based.
         let minY = (extent.minY + (1 - crop.maxY) * extent.height).rounded(.up)
         let maxY = (extent.minY + (1 - crop.minY) * extent.height).rounded(.down)
-        let rect = CGRect(x: minX, y: minY, width: max(maxX - minX, 1), height: max(maxY - minY, 1))
-
-        return image
-            .cropped(to: rect)
-            .settingAlphaOne(in: rect)
-            .transformed(by: CGAffineTransform(translationX: -rect.minX, y: -rect.minY))
+        return CGRect(x: minX, y: minY, width: max(maxX - minX, 1), height: max(maxY - minY, 1))
     }
 
     /// Full rendering recipe. `context` is the one that will render the result.

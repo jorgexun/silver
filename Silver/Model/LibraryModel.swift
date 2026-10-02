@@ -7,23 +7,33 @@ enum ViewMode: Hashable {
     case loupe
 }
 
-/// 100% view of the active photo.
+/// The active photo zoomed in beyond fitting the window.
 struct ZoomState: Equatable {
     let photoID: Photo.ID
-    /// Clicked point, normalized to the displayed image (top-left origin).
+    /// Screen pixels per full-resolution pixel: 1 is 100%.
+    let scale: CGFloat
+    /// Image point to show, normalized to the displayed image (top-left origin), e.g. the one clicked.
     let focus: CGPoint
-    /// Where that point was in the canvas, normalized to the canvas size; it stays under the cursor.
+    /// Where that point goes in the canvas, normalized to the canvas size; it stays under the cursor.
     let anchor: CGPoint
 }
 
-/// Full-resolution pixels for part of the active photo, shown at 100%.
+/// Rendered pixels for part of the zoomed photo.
 struct DetailImage: Identifiable {
     let photoID: Photo.ID
     let image: CGImage
-    /// Area covered, in full-resolution output pixels (top-left origin).
+    /// Area covered, in output pixels at the scale rendered (top-left origin).
     let rect: CGRect
+    /// Size of the whole output at that scale.
+    let size: CGSize
 
     var id: ObjectIdentifier { ObjectIdentifier(image) }
+
+    /// Where the piece goes in the image shown at `content` size.
+    func frame(in content: CGSize) -> CGRect {
+        let x = content.width / size.width, y = content.height / size.height
+        return CGRect(x: rect.minX * x, y: rect.minY * y, width: rect.width * x, height: rect.height * y)
+    }
 }
 
 struct PreviewImage {
@@ -90,15 +100,23 @@ final class LibraryModel {
 
     // MARK: Zoom
 
+    /// nil when the photo fits the window.
     private(set) var zoom: ZoomState?
-    /// Full-resolution output size of the zoomed photo, once known.
-    private(set) var zoomFullSize: CGSize?
-    /// Rendered parts of the photo at 100%, drawn in order: after an edit the area around the
+    /// A zoom being changed by a pinch or the zoom slider. The view shows the photo scaled
+    /// meanwhile, and `zoom` takes it over when the change ends.
+    private(set) var liveZoom: ZoomState?
+    /// Whether the view animates the latest change of zoom. A pinch or the zoom slider has
+    /// already shown it.
+    private(set) var zoomAnimates = true
+    /// The loupe's canvas in points and its screen's pixels per point, for fitting the photo.
+    private(set) var canvasSize: CGSize?
+    private(set) var canvasScale: CGFloat = 2
+    /// Rendered parts of the zoomed photo, drawn in order: after an edit the area around the
     /// visible one, then tiles uncovered by panning.
     private(set) var detail: [DetailImage] = []
-    /// What `detail` was rendered with: settings, and whether it shows the original.
-    private var detailRendering: (settings: EditSettings, original: Bool)?
-    /// Visible area plus a margin, in full-resolution output pixels.
+    /// What `detail` was rendered with: settings, whether it shows the original, and the scale.
+    private var detailRendering: (settings: EditSettings, original: Bool, scale: CGFloat)?
+    /// Visible area plus a margin, in output pixels at the render scale of `zoom`.
     private var detailViewport: CGRect?
     /// Visible area plus a margin, which panning fills in with tiles.
     private var detailCoverage: CGRect?
@@ -446,10 +464,10 @@ final class LibraryModel {
             endInteractiveEdit()
             if let photo = photosByID[id] { interactiveStart = (id, photo.settings, start.name) }
         }
-        if zoom != nil {
-            // Stay at 100% on the same part of the frame, e.g. to compare focus across a burst.
-            zoom = ZoomState(photoID: id, focus: zoomCenter, anchor: CGPoint(x: 0.5, y: 0.5))
-            zoomFullSize = nil
+        liveZoom = nil
+        if let zoom {
+            // Stay at the same zoom on the same part of the frame, e.g. to compare focus across a burst.
+            self.zoom = ZoomState(photoID: id, scale: zoom.scale, focus: zoomCenter, anchor: Self.center)
             clearDetail()
         }
         activeID = id
@@ -791,7 +809,7 @@ final class LibraryModel {
             return
         }
         storePreview(result, for: photo, key: request.key)
-        if photo.imageSize != result.baseSize { photo.imageSize = result.baseSize }
+        noteSizes(of: photo, from: result)
         if isNewest {
             shownSequence = request.sequence
             showPreview(result, for: photo, geometry: request.key.geometry)
@@ -800,6 +818,11 @@ final class LibraryModel {
         if isLast, request.key.geometry, !request.key.original {
             scheduleThumbnailRefresh(for: photo, settings: request.key.settings)
         }
+    }
+
+    private func noteSizes(of photo: Photo, from result: PreviewResult) {
+        if photo.imageSize != result.baseSize { photo.imageSize = result.baseSize }
+        photo.nativeSize = result.nativeSize
     }
 
     private var thumbnailRefreshes: [Photo.ID: Task<Void, Never>] = [:]
@@ -889,7 +912,7 @@ final class LibraryModel {
                 guard photosByID[photo.id] === photo else { continue }
                 if let result {
                     storePreview(result, for: photo, key: key)
-                    if photo.imageSize != result.baseSize { photo.imageSize = result.baseSize }
+                    noteSizes(of: photo, from: result)
                     // Shown from the cache now, if it's the photo waiting for it.
                     if photo.id == activeID { requestPreview() }
                 } else {
@@ -957,26 +980,43 @@ final class LibraryModel {
     }
 
     var canZoomIn: Bool {
-        viewMode == .grid ? thumbnailSize < Self.thumbnailSizes.upperBound : zoom == nil && activePhoto != nil && !isCropping
+        if viewMode == .grid { return thumbnailSize < Self.thumbnailSizes.upperBound }
+        guard activePhoto != nil, !isCropping else { return false }
+        guard let zoom else { return true }
+        return zoom.scale < Self.maxZoomScale
     }
 
     var canZoomOut: Bool {
         viewMode == .grid ? thumbnailSize > Self.thumbnailSizes.lowerBound : zoom != nil
     }
 
-    /// ⌘+: larger thumbnails in the grid, 100% in the loupe.
+    /// ⌘+: larger thumbnails in the grid; in the loupe the next zoom step, keeping the center.
     func zoomIn() {
         if viewMode == .grid {
             thumbnailSize = min(thumbnailSize * 1.25, Self.thumbnailSizes.upperBound)
-        } else if zoom == nil {
-            toggleZoom()
+            return
         }
+        guard let fit = fitScale else {
+            if zoom == nil { toggleZoom() }  // The size isn't known yet; 100% doesn't need it.
+            return
+        }
+        let current = zoom?.scale ?? fit
+        guard let next = Self.zoomSteps.first(where: { $0 > current * 1.01 && $0 > fit * Self.fitSnap }) else { return }
+        zoomAnimates = true
+        setZoom(scale: next, focus: viewCenter, anchor: Self.center)
     }
 
-    /// ⌘−: smaller thumbnails in the grid, fit in the loupe.
+    /// ⌘−: smaller thumbnails in the grid; in the loupe the previous zoom step, down to fit.
     func zoomOut() {
         if viewMode == .grid {
             thumbnailSize = max(thumbnailSize / 1.25, Self.thumbnailSizes.lowerBound)
+            return
+        }
+        guard let zoom else { return }
+        let fit = fitScale ?? 0
+        if let next = Self.zoomSteps.last(where: { $0 < zoom.scale / 1.01 }), next > fit * Self.fitSnap {
+            zoomAnimates = true
+            setZoom(scale: next, focus: viewCenter, anchor: Self.center)
         } else {
             exitZoom()
         }
@@ -984,26 +1024,142 @@ final class LibraryModel {
 
     // MARK: - Zoom
 
+    /// The most the loupe zooms in: four screen pixels per image pixel each way.
+    static let maxZoomScale: CGFloat = 4
+    /// Where ⌘+ and ⌘− stop, as in Lightroom.
+    static let zoomSteps: [CGFloat] = [1 / 8, 1 / 6, 1 / 4, 1 / 3, 1 / 2, 2 / 3, 1, 2, 3, 4]
+    /// Zooms this close to fit go back to fit.
+    private static let fitSnap: CGFloat = 1.04
+    /// Space around the photo when it fits the canvas, in points.
+    static let fitPadding: CGFloat = 28
+    private static let center = CGPoint(x: 0.5, y: 0.5)
+
+    /// Where the photo goes when it fits `container`: as large as it can be inside the padding, centered.
+    static func fitRect(_ size: CGSize, in container: CGSize, padding: CGFloat = fitPadding) -> CGRect {
+        let available = CGSize(width: max(container.width - padding * 2, 1), height: max(container.height - padding * 2, 1))
+        let scale = min(available.width / size.width, available.height / size.height)
+        let fitted = CGSize(width: size.width * scale, height: size.height * scale)
+        return CGRect(
+            x: (container.width - fitted.width) / 2,
+            y: (container.height - fitted.height) / 2,
+            width: fitted.width,
+            height: fitted.height
+        )
+    }
+
+    /// Called by the loupe as its canvas changes size.
+    func setCanvas(_ size: CGSize, scale: CGFloat) {
+        if canvasSize != size { canvasSize = size }
+        if canvasScale != scale { canvasScale = scale }
+    }
+
+    /// The zoom at which the active photo fits the canvas, once its size is known.
+    var fitScale: CGFloat? {
+        guard let canvas = canvasSize, let size = activePhoto?.fullSize, size.width > 0, size.height > 0 else { return nil }
+        let points = CGSize(width: size.width / canvasScale, height: size.height / canvasScale)
+        return Self.fitRect(points, in: canvas).width / points.width
+    }
+
+    /// Whether `scale` is the zoom at which the active photo fits the canvas.
+    func isFit(_ scale: CGFloat) -> Bool {
+        fitScale.map { scale <= $0 * 1.001 } ?? false
+    }
+
+    /// Whether the zoom slider can zoom the active photo: its size is known, it fits the canvas
+    /// below the largest zoom, and it isn't being cropped.
+    var canUseZoomSlider: Bool {
+        guard activePhoto != nil, !isCropping, let fit = fitScale else { return false }
+        return fit < Self.maxZoomScale
+    }
+
+    /// The center of the view, normalized to the photo.
+    private var viewCenter: CGPoint { zoom == nil ? Self.center : zoomCenter }
+
+    /// The zoom slider in the loupe, from fit (0) to the largest zoom (1). Zoom grows
+    /// exponentially along it, so each stretch of the slider zooms by the same factor.
+    var zoomSliderPosition: Double {
+        // In the fit view it's 0, without asking the photo's size, which changes while cropping.
+        guard let current = liveZoom ?? zoom, current.photoID == activeID, canUseZoomSlider, let fit = fitScale else { return 0 }
+        return min(max(log(current.scale / fit) / log(Self.maxZoomScale / fit), 0), 1)
+    }
+
+    /// Zooms by the zoom slider, keeping the center of the view in place: live while it's
+    /// dragged, until `endLiveZoom()`, and otherwise (e.g. from VoiceOver) at once.
+    func setZoomSliderPosition(_ position: Double, live: Bool) {
+        guard canUseZoomSlider, let fit = fitScale else { return }
+        let scale = fit * pow(Self.maxZoomScale / fit, position)
+        updateLiveZoom(scale: scale, focus: liveZoom?.focus ?? viewCenter, anchor: liveZoom?.anchor ?? Self.center)
+        if !live { endLiveZoom() }
+    }
+
+    /// Zooms live, during a pinch or a drag of the zoom slider, between fit and the largest zoom.
+    /// Snaps to fit and to 100% when close to them.
+    func updateLiveZoom(scale: CGFloat, focus: CGPoint, anchor: CGPoint) {
+        guard let photo = activePhoto, viewMode == .loupe, !isCropping, let fit = fitScale else { return }
+        var scale = min(max(scale, fit), max(Self.maxZoomScale, fit))
+        if abs(log(scale)) < 0.04 { scale = 1 }
+        if scale < fit * Self.fitSnap { scale = fit }
+        liveZoom = ZoomState(photoID: photo.id, scale: scale, focus: focus, anchor: anchor)
+    }
+
+    /// Ends a pinch or a drag of the zoom slider: settles on the zoom reached.
+    func endLiveZoom() {
+        guard let live = liveZoom else { return }
+        liveZoom = nil
+        guard live.photoID == activeID else { return }
+        zoomAnimates = false
+        setZoom(scale: live.scale, focus: live.focus, anchor: live.anchor)
+    }
+
+    /// Zooms to `scale`, or back to fit at or below the fit zoom.
+    private func setZoom(scale: CGFloat, focus: CGPoint, anchor: CGPoint) {
+        guard let photo = activePhoto, !isCropping else { return }
+        if isFit(scale) {
+            leaveZoom()
+            return
+        }
+        let next = ZoomState(photoID: photo.id, scale: scale, focus: focus, anchor: anchor)
+        guard let zoom, zoom.photoID == photo.id else {
+            beginZoom(next)
+            return
+        }
+        guard next != zoom else { return }
+        self.zoom = next
+        // What's rendered stays up, scaled, until the view reports what it shows at the new scale.
+        if scale != zoom.scale { resetDetailViewport() }
+    }
+
     /// Switches between fit-to-window and 100% (one image pixel per screen pixel). `focus` is
     /// the image point to zoom into and `anchor` where it should appear in the canvas, both
-    /// normalized; the defaults zoom into the center.
-    func toggleZoom(focus: CGPoint = CGPoint(x: 0.5, y: 0.5), anchor: CGPoint = CGPoint(x: 0.5, y: 0.5)) {
+    /// normalized; the defaults zoom into the center. Unlike `setZoom`, goes to 100% even for
+    /// a photo smaller than the canvas.
+    func toggleZoom(focus: CGPoint = center, anchor: CGPoint = center) {
+        zoomAnimates = true
         if zoom != nil {
-            exitZoom()
+            leaveZoom()
             return
         }
         guard let photo = activePhoto, !isCropping else { return }
+        beginZoom(ZoomState(photoID: photo.id, scale: 1, focus: focus, anchor: anchor))
+    }
+
+    private func beginZoom(_ state: ZoomState) {
         viewMode = .loupe
-        zoom = ZoomState(photoID: photo.id, focus: focus, anchor: anchor)
-        zoomFullSize = nil
+        liveZoom = nil
+        zoom = state
         clearDetail()
         requestDetail()
     }
 
     func exitZoom(refreshPreview: Bool = true) {
+        zoomAnimates = true
+        leaveZoom(refreshPreview: refreshPreview)
+    }
+
+    private func leaveZoom(refreshPreview: Bool = true) {
+        liveZoom = nil
         guard zoom != nil else { return }
         zoom = nil
-        zoomFullSize = nil
         clearDetail()
         if refreshPreview, previewStaleWhileZoomed {
             previewStaleWhileZoomed = false
@@ -1014,20 +1170,32 @@ final class LibraryModel {
     private func clearDetail() {
         detail = []
         detailRendering = nil
+        resetDetailViewport()
+    }
+
+    /// Forgets what the view shows, until it reports it again.
+    private func resetDetailViewport() {
         detailViewport = nil
         detailCoverage = nil
         detailLead = nil
         lastZoomViewport = nil
     }
 
-    /// Called as the zoomed view scrolls; `rect` is the visible area in full-resolution pixels.
-    func setZoomViewport(_ rect: CGRect) {
-        guard zoom != nil, let fullSize = zoomFullSize else { return }
+    /// Detail is rendered at the zoom, or at full resolution when zoomed in further.
+    private static func renderScale(_ zoom: CGFloat) -> CGFloat { min(zoom, 1) }
+
+    /// Called as the zoomed view scrolls or changes scale; `rect` is the visible area in
+    /// full-resolution pixels, and `scale` the zoom the view has it laid out at.
+    func setZoomViewport(_ rect: CGRect, scale: CGFloat) {
+        guard let zoom, zoom.scale == scale, let fullSize = activePhoto?.fullSize else { return }
         zoomCenter = CGPoint(
             x: min(max(rect.midX / fullSize.width, 0), 1),
             y: min(max(rect.midY / fullSize.height, 0), 1)
         )
-        let bounds = CGRect(origin: .zero, size: fullSize)
+        // From here on in pixels at the render scale, which is what rendering costs.
+        let render = Self.renderScale(scale)
+        let rect = rect.applying(CGAffineTransform(scaleX: render, y: render))
+        let bounds = CGRect(x: 0, y: 0, width: (fullSize.width * render).rounded(), height: (fullSize.height * render).rounded())
         // After an edit, the area around the visible one is rendered in one go, up to 256 px
         // around it but within Core Image's cache budget (see "100% zoom" in CLAUDE.md).
         let budget: CGFloat = 14_000_000
@@ -1059,27 +1227,29 @@ final class LibraryModel {
     /// about 15 ms, where re-rendering the whole area would take about 80 ms.
     private static let detailTileSize: CGFloat = 512
 
-    /// Whether `detail` shows the active photo with its current settings.
+    /// Whether `detail` shows the active photo with its current settings at the current zoom.
     private var isDetailCurrent: Bool {
-        guard let photo = activePhoto, let rendering = detailRendering, detail.first?.photoID == photo.id else { return false }
+        guard let photo = activePhoto, let zoom, let rendering = detailRendering, detail.first?.photoID == photo.id else { return false }
         return rendering.original == showOriginal && rendering.settings == (showOriginal ? photo.settings.original : photo.settings)
+            && rendering.scale == Self.renderScale(zoom.scale)
     }
 
     /// Tiles whose part inside `coverage` the rendered parts don't cover, merged into rows and then
     /// into columns, so a pan renders the strip it uncovers as one or a few rectangles.
     private func missingDetailTiles(in coverage: CGRect?) -> [CGRect] {
-        guard let coverage, let fullSize = zoomFullSize, !coverage.isEmpty else { return [] }
+        guard let coverage, let size = detail.first?.size, !coverage.isEmpty else { return [] }
         let tile = Self.detailTileSize
-        let bounds = CGRect(origin: .zero, size: fullSize)
+        let bounds = CGRect(origin: .zero, size: size)
         let columns = Int((coverage.minX / tile).rounded(.down))...Int((coverage.maxX / tile).rounded(.up)) - 1
         let rows = Int((coverage.minY / tile).rounded(.down))...Int((coverage.maxY / tile).rounded(.up)) - 1
+        let rendered = detail.map(\.rect)[...]
         var runs: [CGRect] = []
         for row in rows {
             var run: CGRect?
             for column in columns {
                 let rect = CGRect(x: CGFloat(column) * tile, y: CGFloat(row) * tile, width: tile, height: tile).intersection(bounds)
                 let needed = rect.intersection(coverage)
-                if needed.isEmpty || Self.isCovered(needed, by: detail.map(\.rect)[...]) {
+                if needed.isEmpty || Self.isCovered(needed, by: rendered) {
                     if let finished = run { runs.append(finished) }
                     run = nil
                 } else {
@@ -1130,6 +1300,7 @@ final class LibraryModel {
                 }
                 let original = showOriginal
                 let settings = original ? photo.settings.original : photo.settings
+                let scale = Self.renderScale(zoom.scale)
                 // An edit re-renders everything shown in one go, which Core Image can cache for
                 // the next step of a slider drag; a pan adds the tiles it uncovers.
                 let isPan = isDetailCurrent
@@ -1138,19 +1309,25 @@ final class LibraryModel {
                     let near = missingDetailTiles(in: detailCoverage)
                     rects = near.isEmpty ? missingDetailTiles(in: detailLead) : near
                     if rects.isEmpty { continue }
+                } else if let detailViewport {
+                    rects = [detailViewport]
+                } else if photo.fullSize == nil {
+                    rects = []  // Only get the size, so the view can lay out.
                 } else {
-                    rects = detailViewport.map { [$0] } ?? []  // None yet: only get the size.
+                    continue  // The view reports what it shows once laid out.
                 }
                 let result = await renderer.renderDetail(
                     url: photo.url,
                     settings: settings,
+                    scale: scale,
                     rects: rects,
                     colorSpace: displayColorSpace
                 )
-                guard self.zoom?.photoID == photo.id, let result else { continue }
-                if zoomFullSize != result.fullSize { zoomFullSize = result.fullSize }
-                guard !result.pieces.isEmpty else { continue }
-                let pieces = result.pieces.map { DetailImage(photoID: photo.id, image: $0.image, rect: $0.rect) }
+                guard let zoom = self.zoom, zoom.photoID == photo.id, let result else { continue }
+                photo.nativeSize = result.nativeSize
+                // A change of zoom meanwhile asks for the new scale once the view shows it.
+                guard !result.pieces.isEmpty, Self.renderScale(zoom.scale) == scale else { continue }
+                let pieces = result.pieces.map { DetailImage(photoID: photo.id, image: $0.image, rect: $0.rect, size: result.size) }
                 if isPan {
                     // After an edit meanwhile, the pending request renders everything again.
                     guard isDetailCurrent else { continue }
@@ -1161,7 +1338,7 @@ final class LibraryModel {
                     // Tiles around it are left to the next pan: rendering them now would hold up
                     // the next step of a slider drag and push this area out of Core Image's cache.
                     detail = pieces
-                    detailRendering = (settings, original)
+                    detailRendering = (settings, original, scale)
                 }
             }
             detailTask = nil

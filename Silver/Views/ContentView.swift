@@ -12,11 +12,15 @@ struct ContentView: View {
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 360)
         } detail: {
             content
-                .inspector(isPresented: $library.isInspectorPresented) {
-                    InspectorView()
-                        .inspectorColumnWidth(min: 260, ideal: 290, max: 380)
-                }
                 .toolbar { toolbar }
+        }
+        // On the split view, not the detail, so the inspector is a column with its own part of
+        // the toolbar: the zoom slider then ends where the canvas does, and the photo actions sit
+        // over the inspector. When it's hidden, they move next to the slider.
+        .inspector(isPresented: $library.isInspectorPresented) {
+            InspectorView()
+                .inspectorColumnWidth(min: 260, ideal: 290, max: 380)
+                .toolbar { inspectorToolbar }
         }
         .onAppear { library.isWindowOpen = true }
         // Closing the window keeps the app running, so write pending edits now.
@@ -86,7 +90,7 @@ struct ContentView: View {
         }
     }
 
-    /// The photo count, or in the loupe the active photo's position.
+    /// The photo count and how many are edited, or in the loupe the active photo's position.
     private var subtitle: String {
         guard library.folderURL != nil, !library.isScanning, !library.photos.isEmpty else { return "" }
         let count = library.photos.count
@@ -97,6 +101,10 @@ struct ContentView: View {
             parts = [count == 1 ? "1 photo" : "\(count) photos"]
         }
         if library.selection.count > 1 { parts.append("\(library.selection.count) selected") }
+        if library.viewMode == .grid {
+            let edited = library.photos.filter(\.isEdited).count
+            if edited > 0 { parts.append("\(edited) edited") }
+        }
         return parts.joined(separator: " · ")
     }
 
@@ -114,6 +122,16 @@ struct ContentView: View {
             .help("Grid (G) / Loupe (E)")
             .disabled(library.photos.isEmpty)
         }
+
+        ToolbarItem(placement: .primaryAction) { ZoomSlider() }
+    }
+
+    @ToolbarContentBuilder
+    private var inspectorToolbar: some ToolbarContent {
+        @Bindable var library = library
+
+        // Items in the inspector's part of the toolbar otherwise start at its leading edge.
+        ToolbarSpacer(.flexible, placement: .primaryAction)
 
         ToolbarItemGroup(placement: .primaryAction) {
             Toggle(isOn: $library.showOriginal) {
@@ -136,5 +154,57 @@ struct ContentView: View {
             }
             .help("Show or Hide Adjustments (⌥⌘I)")
         }
+    }
+}
+
+/// Thumbnail size in the grid; in the loupe, the zoom of the photo, from fit to 400%.
+private struct ZoomSlider: View {
+    @Environment(LibraryModel.self) private var library
+    @State private var isSliding = false
+
+    var body: some View {
+        @Bindable var library = library
+        let isGrid = library.viewMode == .grid
+
+        HStack(spacing: 6) {
+            Image(systemName: isGrid ? "square.grid.3x3" : "minus.magnifyingglass")
+                .imageScale(.small)
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Group {
+                if isGrid {
+                    TrackSlider(
+                        value: $library.thumbnailSize,
+                        range: LibraryModel.thumbnailSizes,
+                        origin: LibraryModel.thumbnailSizes.lowerBound
+                    )
+                } else {
+                    // Dragging zooms live; letting go settles on the zoom.
+                    TrackSlider(
+                        value: Binding(
+                            get: { library.zoomSliderPosition },
+                            set: { library.setZoomSliderPosition($0, live: isSliding) }
+                        ),
+                        range: 0...1,
+                        origin: 0,
+                        onEditingChanged: { editing in
+                            isSliding = editing
+                            if !editing { library.endLiveZoom() }
+                        },
+                        onReset: { library.exitZoom() }
+                    )
+                    .disabled(!library.canUseZoomSlider)
+                }
+            }
+            .frame(width: 110)
+            Image(systemName: isGrid ? "square.grid.2x2" : "plus.magnifyingglass")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+        }
+        .padding(.horizontal, 6)
+        .help(isGrid ? "Thumbnail Size (⌘+ / ⌘−)" : "Zoom (⌘+ / ⌘−, Z for 100%)")
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(isGrid ? "Thumbnail Size" : "Zoom")
+        .disabled(library.photos.isEmpty)
     }
 }
