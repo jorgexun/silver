@@ -10,17 +10,15 @@ struct InspectorView: View {
                 VStack(alignment: .leading, spacing: 22) {
                     PhotoInfoHeader(photo: photo)
                     if library.isCropping {
+                        // Cropping edits only the crop, so the other adjustments are hidden.
                         CropSection(photo: photo)
                     } else {
                         GeometrySection(photo: photo)
-                    }
-                    // The same groups as Copy Adjustments… offers. Cropping edits only the crop.
-                    Group {
+                        // The same groups as Copy Adjustments… offers.
                         AdjustmentSection(title: "Light", adjustments: Adjustment.light, photo: photo)
                         AdjustmentSection(title: "White Balance", adjustments: Adjustment.whiteBalance, photo: photo)
                         AdjustmentSection(title: "Color", adjustments: Adjustment.color, photo: photo)
                     }
-                    .disabled(library.isCropping)
                 }
                 .padding(16)
             }
@@ -295,11 +293,17 @@ private struct PhotoInfoHeader: View {
                         .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 4))
                         .fixedSize()
                     Spacer(minLength: 0)
-                    // Resetting several photos is in the Photo menu.
-                    Button("Reset") { library.resetActive(.all, actionName: "Reset Adjustments") }
+                    // Resetting several photos is in the Photo menu. Hidden while cropping, keeping
+                    // its space so the header doesn't move.
+                    let reset = Button("Reset") { library.resetActive(.all, actionName: "Reset Adjustments") }
                         .controlSize(.small)
-                        .disabled(!photo.isEdited || library.isCropping)
+                        .disabled(!photo.isEdited)
                         .help("Reset This Photo's Adjustments")
+                    if library.isCropping {
+                        reset.hidden()
+                    } else {
+                        reset
+                    }
                 }
                 if let metadata = photo.metadata {
                     let equipment = [metadata.camera, metadata.lens].compactMap(\.self)
