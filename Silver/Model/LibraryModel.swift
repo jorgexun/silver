@@ -1,5 +1,6 @@
 import AppKit
 import Observation
+import Synchronization
 
 enum ViewMode: Hashable {
     case grid
@@ -16,11 +17,13 @@ struct ZoomState: Equatable {
 }
 
 /// Full-resolution pixels for part of the active photo, shown at 100%.
-struct DetailImage {
+struct DetailImage: Identifiable {
     let photoID: Photo.ID
     let image: CGImage
     /// Area covered, in full-resolution output pixels (top-left origin).
     let rect: CGRect
+
+    var id: ObjectIdentifier { ObjectIdentifier(image) }
 }
 
 struct PreviewImage {
@@ -52,6 +55,7 @@ final class LibraryModel {
         didSet {
             guard viewMode != oldValue else { return }
             if viewMode == .loupe {
+                loadPlaceholder()
                 requestPreview()
             } else {
                 endCrop()
@@ -77,15 +81,28 @@ final class LibraryModel {
     // MARK: Preview
 
     private(set) var preview: PreviewImage?
+    /// The camera's embedded preview at screen size, shown until an unedited photo's first render.
+    private(set) var placeholder: PreviewImage?
+    private var placeholderTask: Task<Void, Never>?
 
     // MARK: Zoom
 
     private(set) var zoom: ZoomState?
     /// Full-resolution output size of the zoomed photo, once known.
     private(set) var zoomFullSize: CGSize?
-    private(set) var detail: DetailImage?
+    /// Rendered parts of the photo at 100%, drawn in order: after an edit the area around the
+    /// visible one, then tiles uncovered by panning.
+    private(set) var detail: [DetailImage] = []
+    /// What `detail` was rendered with: settings, and whether it shows the original.
+    private var detailRendering: (settings: EditSettings, original: Bool)?
     /// Visible area plus a margin, in full-resolution output pixels.
     private var detailViewport: CGRect?
+    /// Visible area plus a margin, which panning fills in with tiles.
+    private var detailCoverage: CGRect?
+    /// `detailCoverage` extended in the direction of a pan, filled in after it.
+    private var detailLead: CGRect?
+    /// Last visible area and when it was reported, for the speed of a pan.
+    private var lastZoomViewport: (rect: CGRect, time: TimeInterval)?
     /// Center of the visible area, normalized to the image; carried over to the next photo.
     private var zoomCenter = CGPoint(x: 0.5, y: 0.5)
     private var detailTask: Task<Void, Never>?
@@ -93,9 +110,38 @@ final class LibraryModel {
     /// Edits made while zoomed only re-render the visible detail; the fit preview catches up on exit.
     private var previewStaleWhileZoomed = false
     private let renderer = PreviewRenderer()
-    private var renderTask: Task<Void, Never>?
-    private var renderPending = false
-    private var renderForThumbnail = false
+    private let previewQueue = PreviewQueue()
+    /// Numbers preview requests, so a render that finishes late never replaces a newer preview.
+    private var previewSequence = 0
+    private var shownSequence = 0
+
+    // MARK: Preview cache
+
+    /// What a preview was rendered for. A cached preview is shown only for the same request.
+    nonisolated struct PreviewKey: Equatable, Sendable {
+        let settings: EditSettings
+        let geometry: Bool
+        let pixelSize: CGFloat
+        let colorSpace: CGColorSpace
+    }
+
+    /// Recent previews, most recent last: photos just shown, and the ones next to the active
+    /// photo, rendered ahead of time. One per photo and kind (with or without crop), so a
+    /// slider drag replaces its entry instead of pushing the others out.
+    private var previewCache: [(id: Photo.ID, key: PreviewKey, result: PreviewResult)] = []
+    private static let previewCacheLimit = 6
+    private var prefetchTask: Task<Void, Never>?
+    /// The photo being prefetched; showing it waits for that instead of decoding it again.
+    private var prefetching: (id: Photo.ID, key: PreviewKey, task: Task<PreviewResult?, Never>)?
+    private var prefetchFailures: Set<Photo.ID> = []
+    /// Direction of the last step through the photos, so the photo coming next is prefetched first.
+    private var stepDirection = 1
+    /// Set while photos are stepped through quickly, e.g. with an arrow key held down. Decoding
+    /// then waits until the stepping pauses: a decode can't be stopped, so one for a photo already
+    /// passed would hold up the photo the user stops at.
+    private var isSteppingQuickly = false
+    private var lastActivation = Date.distantPast
+    private var deferredPreview: Task<Void, Never>?
 
     // MARK: Clipboard
 
@@ -277,6 +323,9 @@ final class LibraryModel {
         activeID = nil
         anchorID = nil
         preview = nil
+        placeholder = nil
+        previewCache = []
+        prefetchFailures = []
         undoStack = []
         redoStack = []
         thumbnailQueue = []
@@ -369,6 +418,7 @@ final class LibraryModel {
         // A row step past the first or last row stops at the first or last photo, as in Photos.
         if abs(offset) > 1 { index = min(max(index, 0), photos.count - 1) }
         guard photos.indices.contains(index), index != current else { return }
+        stepDirection = offset < 0 ? -1 : 1
         if extend, let anchor = anchorID.flatMap({ id in photos.firstIndex { $0.id == id } }) {
             selectRange(from: anchor, to: index)
         } else {
@@ -395,15 +445,25 @@ final class LibraryModel {
             // Stay at 100% on the same part of the frame, e.g. to compare focus across a burst.
             zoom = ZoomState(photoID: id, focus: zoomCenter, anchor: CGPoint(x: 0.5, y: 0.5))
             zoomFullSize = nil
-            detail = nil
-            detailViewport = nil
+            clearDetail()
         }
         activeID = id
         showOriginal = false
-        if let photo = photosByID[id], photo.metadata == nil {
+        isSteppingQuickly = Date.now.timeIntervalSince(lastActivation) < 0.25
+        lastActivation = .now
+        guard let photo = photosByID[id] else { return }
+        if photo.metadata == nil {
             enqueueThumbnails([photo], atFront: true)
         }
+        // A photo rendered ahead of time shows right away, also as the base of the 100% view.
+        if let cached = cachedPreview(for: photo, key: previewKey(for: photo)) {
+            showPreview(cached, for: photo, geometry: true)
+        } else {
+            placeholderAttempt = nil
+            loadPlaceholder()
+        }
         requestPreview()
+        schedulePrefetch()
     }
 
     // MARK: - Editing
@@ -648,10 +708,24 @@ final class LibraryModel {
         previewScreen?.colorSpace?.cgColorSpace ?? ImagePipeline.sRGB
     }
 
-    /// Renders the active photo. Requests made while a render is running are coalesced.
+    /// Renders the active photo. A loop off the main actor renders the latest request, so a render
+    /// starts as soon as an edit asks for it instead of after the main actor has updated the views
+    /// for the edit, and one render follows another without waiting for the last to be shown.
     private func requestPreview(forThumbnail: Bool = false) {
-        guard activePhoto != nil else {
+        guard let photo = activePhoto else {
             preview = nil
+            return
+        }
+        deferredPreview?.cancel()
+        if isSteppingQuickly, preview?.photoID != photo.id, cachedPreview(for: photo, key: previewKey(for: photo)) == nil {
+            // Shows the placeholder or thumbnail meanwhile.
+            deferredPreview = Task {
+                try? await Task.sleep(for: .milliseconds(200))
+                guard !Task.isCancelled else { return }
+                isSteppingQuickly = false
+                requestPreview(forThumbnail: forThumbnail)
+                schedulePrefetch()
+            }
             return
         }
         if zoom != nil {
@@ -661,45 +735,195 @@ final class LibraryModel {
             return
         }
         guard viewMode == .loupe || forThumbnail else { return }
-        renderPending = true
-        renderForThumbnail = renderForThumbnail || forThumbnail
-        guard renderTask == nil else { return }
+        let original = showOriginal
+        let geometry = !isCropping && !original
+        let key = previewKey(for: photo, original: original, geometry: geometry)
+        previewSequence += 1
+        if let cached = cachedPreview(for: photo, key: key) {
+            shownSequence = previewSequence
+            showPreview(cached, for: photo, geometry: geometry)
+            guard viewMode == .loupe else { return }
+            // The cached preview came from another context or an earlier render. Develop the
+            // photo again while nothing waits on it, so Core Image has it cached and the first
+            // step of a slider drag takes milliseconds instead of about 0.15 s.
+            post(PreviewRequest(photoID: photo.id, url: photo.url, key: key, sequence: previewSequence, showsResult: false, prefetch: nil))
+            return
+        }
+        // A photo being prefetched is shown when that's done, rather than decoded twice. With
+        // other settings the render waits for the decode.
+        if let prefetching, prefetching.id == photo.id, prefetching.key == key { return }
+        let prefetch = prefetching.flatMap { $0.id == photo.id ? $0.task : nil }
+        post(PreviewRequest(photoID: photo.id, url: photo.url, key: key, sequence: previewSequence, showsResult: true, prefetch: prefetch))
+    }
 
-        renderTask = Task {
-            while renderPending {
-                renderPending = false
-                let wantsThumbnail = renderForThumbnail
-                renderForThumbnail = false
-                guard let photo = activePhoto, viewMode == .loupe || wantsThumbnail else { break }
-
-                let original = showOriginal
-                let geometry = !isCropping && !original
-                let settings = original ? EditSettings.default : photo.settings
+    private func post(_ request: PreviewRequest) {
+        guard previewQueue.post(request) else { return }
+        let queue = previewQueue, renderer = renderer
+        Task.detached(priority: .userInitiated) { [self] in
+            while let request = queue.take() {
+                _ = await request.prefetch?.value
                 let result = await renderer.render(
-                    url: photo.url,
-                    settings: settings,
-                    geometry: geometry,
-                    maxPixelSize: previewPixelSize,
-                    colorSpace: displayColorSpace
+                    url: request.url,
+                    settings: request.key.settings,
+                    geometry: request.key.geometry,
+                    maxPixelSize: request.key.pixelSize,
+                    colorSpace: request.key.colorSpace
                 )
-
-                guard let result else {
-                    if photo.id == activeID, viewMode == .loupe {
-                        preview = nil
-                    }
-                    continue
-                }
-                photo.imageSize = result.baseSize
-                if photo.id == activeID {
-                    preview = PreviewImage(photoID: photo.id, image: result.image, hasGeometry: geometry)
-                }
-                // Refresh the thumbnail once edits pause, not on every step of a slider drag.
-                if geometry, !renderPending, let thumbnail = await renderer.thumbnail(), photo.settings == settings {
-                    photo.thumbnail = thumbnail
+                if request.showsResult {
+                    let isLast = !queue.hasNext
+                    Task { @MainActor in didRender(request, result, isLast: isLast) }
                 }
             }
-            renderTask = nil
+            Task { @MainActor in schedulePrefetch() }
         }
+    }
+
+    private func didRender(_ request: PreviewRequest, _ result: PreviewResult?, isLast: Bool) {
+        guard let photo = photosByID[request.photoID] else { return }
+        let isNewest = photo.id == activeID && request.sequence > shownSequence
+        guard let result else {
+            if isNewest, viewMode == .loupe { preview = nil }
+            return
+        }
+        storePreview(result, for: photo, key: request.key)
+        if photo.imageSize != result.baseSize { photo.imageSize = result.baseSize }
+        if isNewest {
+            shownSequence = request.sequence
+            showPreview(result, for: photo, geometry: request.key.geometry)
+        }
+        // Once a slider drag pauses.
+        if isLast, request.key.geometry {
+            scheduleThumbnailRefresh(for: photo, settings: request.key.settings)
+        }
+    }
+
+    private var thumbnailRefreshes: [Photo.ID: Task<Void, Never>] = [:]
+
+    /// Refreshes a thumbnail from the preview once edits pause, not between the steps of a slider
+    /// drag: the downscale takes about 30 ms of GPU time that the next step would wait for.
+    private func scheduleThumbnailRefresh(for photo: Photo, settings: EditSettings) {
+        thumbnailRefreshes[photo.id]?.cancel()
+        thumbnailRefreshes[photo.id] = Task {
+            repeat {
+                try? await Task.sleep(for: .milliseconds(300))
+            } while !Task.isCancelled && previewQueue.isRunning
+            defer { if !Task.isCancelled { thumbnailRefreshes[photo.id] = nil } }
+            guard !Task.isCancelled, photo.settings == settings,
+                  let thumbnail = await renderer.thumbnail(url: photo.url, settings: settings),
+                  photo.settings == settings
+            else { return }
+            photo.thumbnail = thumbnail
+        }
+    }
+
+    private func showPreview(_ result: PreviewResult, for photo: Photo, geometry: Bool) {
+        guard preview?.photoID != photo.id || preview?.image !== result.image else { return }
+        preview = PreviewImage(photoID: photo.id, image: result.image, hasGeometry: geometry)
+        if placeholder?.photoID == photo.id { placeholder = nil }
+    }
+
+    // MARK: - Preview cache and prefetching
+
+    private func previewKey(for photo: Photo, original: Bool = false, geometry: Bool = true) -> PreviewKey {
+        PreviewKey(
+            settings: original ? .default : photo.settings,
+            geometry: geometry,
+            pixelSize: previewPixelSize,
+            colorSpace: displayColorSpace
+        )
+    }
+
+    private func cachedPreview(for photo: Photo, key: PreviewKey) -> PreviewResult? {
+        previewCache.last { $0.id == photo.id && $0.key == key }?.result
+    }
+
+    private func storePreview(_ result: PreviewResult, for photo: Photo, key: PreviewKey) {
+        previewCache.removeAll { $0.id == photo.id && $0.key.geometry == key.geometry }
+        previewCache.append((photo.id, key, result))
+        if previewCache.count > Self.previewCacheLimit { previewCache.removeFirst() }
+    }
+
+    /// Photos worth rendering ahead of time: in the loupe the ones next to the active photo, the
+    /// one coming next first; in the grid the active photo, which Space or a double-click opens.
+    private var prefetchCandidates: [Photo] {
+        guard let index = activeIndex, !isCropping else { return [] }
+        let indices = viewMode == .grid ? [index] : [index + stepDirection, index - stepDirection]
+        return indices.filter { photos.indices.contains($0) }.map { photos[$0] }
+    }
+
+    /// The next photo to prefetch, once the active photo has been rendered.
+    private func nextPrefetch() -> Photo? {
+        guard !previewQueue.isRunning, detailTask == nil, !isSteppingQuickly else { return nil }
+        return prefetchCandidates.first { photo in
+            !prefetchFailures.contains(photo.id) && cachedPreview(for: photo, key: previewKey(for: photo)) == nil
+        }
+    }
+
+    /// Renders the photos the user is likely to look at next, one at a time, in the background.
+    /// Decoding a RAW file takes most of the time to open it, so after this the photo shows at once
+    /// and its first edit only waits for the GPU (about 0.15 s instead of 0.8 s for M11 files).
+    private func schedulePrefetch() {
+        guard prefetchTask == nil, nextPrefetch() != nil else { return }
+        prefetchTask = Task {
+            while let photo = nextPrefetch() {
+                if viewMode == .grid {
+                    // Let the selection settle, so moving through the grid doesn't decode every photo.
+                    try? await Task.sleep(for: .milliseconds(300))
+                    guard nextPrefetch() === photo else { continue }
+                }
+                let key = previewKey(for: photo)
+                let renderer = renderer
+                let task = Task {
+                    await renderer.prefetch(url: photo.url, settings: key.settings, maxPixelSize: key.pixelSize, colorSpace: key.colorSpace)
+                }
+                prefetching = (photo.id, key, task)
+                let result = await task.value
+                prefetching = nil
+                // The folder may have changed meanwhile.
+                guard photosByID[photo.id] === photo else { continue }
+                if let result {
+                    storePreview(result, for: photo, key: key)
+                    if photo.imageSize != result.baseSize { photo.imageSize = result.baseSize }
+                    // Shown from the cache now, if it's the photo waiting for it.
+                    if photo.id == activeID { requestPreview() }
+                } else {
+                    prefetchFailures.insert(photo.id)
+                    if photo.id == activeID { requestPreview() }
+                }
+            }
+            prefetchTask = nil
+        }
+    }
+
+    /// Shows the camera's embedded preview of an unedited RAW photo until it has been rendered,
+    /// instead of the small thumbnail. Edited photos keep their thumbnail, which shows the edits.
+    /// One loads at a time; moving on through the photos meanwhile skips the ones passed.
+    private func loadPlaceholder() {
+        if placeholder?.photoID != activeID { placeholder = nil }
+        guard placeholderTask == nil else { return }
+        placeholderTask = Task {
+            // A photo without an embedded preview is tried once.
+            while let photo = placeholderCandidate(), photo.id != placeholderAttempt {
+                placeholderAttempt = photo.id
+                let url = photo.url, pixelSize = previewPixelSize, colorSpace = displayColorSpace
+                let image = await Task.detached(priority: .userInitiated) {
+                    Thumbnails.screenPreview(url: url, maxPixelSize: pixelSize, colorSpace: colorSpace)
+                }.value
+                if let image, placeholderCandidate() === photo {
+                    placeholder = PreviewImage(photoID: photo.id, image: image, hasGeometry: true)
+                }
+            }
+            placeholderTask = nil
+        }
+    }
+
+    private var placeholderAttempt: Photo.ID?
+
+    private func placeholderCandidate() -> Photo? {
+        guard viewMode == .loupe, let photo = activePhoto, photo.isRaw, !photo.isEdited,
+              preview?.photoID != photo.id, placeholder?.photoID != photo.id
+        else { return nil }
+        return photo
     }
 
     // MARK: - Viewing
@@ -766,8 +990,7 @@ final class LibraryModel {
         viewMode = .loupe
         zoom = ZoomState(photoID: photo.id, focus: focus, anchor: anchor)
         zoomFullSize = nil
-        detail = nil
-        detailViewport = nil
+        clearDetail()
         requestDetail()
     }
 
@@ -775,12 +998,20 @@ final class LibraryModel {
         guard zoom != nil else { return }
         zoom = nil
         zoomFullSize = nil
-        detail = nil
-        detailViewport = nil
+        clearDetail()
         if refreshPreview, previewStaleWhileZoomed {
             previewStaleWhileZoomed = false
             requestPreview(forThumbnail: true)
         }
+    }
+
+    private func clearDetail() {
+        detail = []
+        detailRendering = nil
+        detailViewport = nil
+        detailCoverage = nil
+        detailLead = nil
+        lastZoomViewport = nil
     }
 
     /// Called as the zoomed view scrolls; `rect` is the visible area in full-resolution pixels.
@@ -790,21 +1021,93 @@ final class LibraryModel {
             x: min(max(rect.midX / fullSize.width, 0), 1),
             y: min(max(rect.midY / fullSize.height, 0), 1)
         )
-        // Render a margin around the visible area so small pans don't reveal the soft base, up to
-        // 256 px but within Core Image's cache budget (see "100% zoom" in CLAUDE.md).
+        let bounds = CGRect(origin: .zero, size: fullSize)
+        // After an edit, the area around the visible one is rendered in one go, up to 256 px
+        // around it but within Core Image's cache budget (see "100% zoom" in CLAUDE.md).
         let budget: CGFloat = 14_000_000
         let sum = rect.width + rect.height
         // Solves (width + 2 inset) × (height + 2 inset) = budget.
         let fit = (-sum + (sum * sum - 4 * (rect.width * rect.height - budget)).squareRoot()) / 4
         let inset = min(max(fit, 0), 256)
-        let margin = rect.insetBy(dx: -inset, dy: -inset)
-        let viewport = margin.integral.intersection(CGRect(origin: .zero, size: fullSize))
-        if let detail, detail.photoID == activeID, detail.rect.contains(rect), detailViewport != nil {
-            detailViewport = viewport
-            return  // Visible area is already covered.
+        detailViewport = rect.insetBy(dx: -inset, dy: -inset).integral.intersection(bounds)
+        // Panning renders the tiles that reach into this margin first, then those where the pan
+        // is heading: as far as it goes in 0.15 s, up to two tiles.
+        let coverage = rect.insetBy(dx: -256, dy: -256).integral
+        let now = ProcessInfo.processInfo.systemUptime
+        var lead = coverage
+        if let last = lastZoomViewport, now - last.time < 0.1 {
+            let elapsed = max(now - last.time, 0.004)
+            let reach = Self.detailTileSize * 2
+            let dx = min(max((rect.midX - last.rect.midX) / elapsed * 0.15, -reach), reach)
+            let dy = min(max((rect.midY - last.rect.midY) / elapsed * 0.15, -reach), reach)
+            lead = lead.union(lead.offsetBy(dx: dx, dy: dy))
         }
-        detailViewport = viewport
+        lastZoomViewport = (rect, now)
+        detailCoverage = coverage.intersection(bounds)
+        detailLead = lead.intersection(bounds)
+        if detailTask == nil, isDetailCurrent, missingDetailTiles(in: detailLead).isEmpty { return }
         requestDetail()
+    }
+
+    /// Edge length of the tiles panning renders. A column of them on a 5K display renders in
+    /// about 15 ms, where re-rendering the whole area would take about 80 ms.
+    private static let detailTileSize: CGFloat = 512
+
+    /// Whether `detail` shows the active photo with its current settings.
+    private var isDetailCurrent: Bool {
+        guard let photo = activePhoto, let rendering = detailRendering, detail.first?.photoID == photo.id else { return false }
+        return rendering.original == showOriginal && rendering.settings == (showOriginal ? .default : photo.settings)
+    }
+
+    /// Tiles whose part inside `coverage` the rendered parts don't cover, merged into rows and then
+    /// into columns, so a pan renders the strip it uncovers as one or a few rectangles.
+    private func missingDetailTiles(in coverage: CGRect?) -> [CGRect] {
+        guard let coverage, let fullSize = zoomFullSize, !coverage.isEmpty else { return [] }
+        let tile = Self.detailTileSize
+        let bounds = CGRect(origin: .zero, size: fullSize)
+        let columns = Int((coverage.minX / tile).rounded(.down))...Int((coverage.maxX / tile).rounded(.up)) - 1
+        let rows = Int((coverage.minY / tile).rounded(.down))...Int((coverage.maxY / tile).rounded(.up)) - 1
+        var runs: [CGRect] = []
+        for row in rows {
+            var run: CGRect?
+            for column in columns {
+                let rect = CGRect(x: CGFloat(column) * tile, y: CGFloat(row) * tile, width: tile, height: tile).intersection(bounds)
+                let needed = rect.intersection(coverage)
+                if needed.isEmpty || Self.isCovered(needed, by: detail.map(\.rect)[...]) {
+                    if let finished = run { runs.append(finished) }
+                    run = nil
+                } else {
+                    run = run.map { $0.union(rect) } ?? rect
+                }
+            }
+            if let run { runs.append(run) }
+        }
+        // Stack runs that span the same columns in consecutive rows.
+        var merged: [CGRect] = []
+        for run in runs {
+            if let index = merged.lastIndex(where: { $0.minX == run.minX && $0.maxX == run.maxX && $0.maxY == run.minY }) {
+                merged[index] = merged[index].union(run)
+            } else {
+                merged.append(run)
+            }
+        }
+        return merged
+    }
+
+    /// Whether the union of `pieces` covers `rect`.
+    private static func isCovered(_ rect: CGRect, by pieces: ArraySlice<CGRect>) -> Bool {
+        guard let piece = pieces.first(where: { $0.intersects(rect) }) else { return false }
+        let overlap = rect.intersection(piece)
+        guard overlap.width * overlap.height > 0 else { return false }
+        let rest = pieces.drop { $0 != piece }.dropFirst()
+        // The parts of `rect` left of, right of, above and below the overlap.
+        let remainders = [
+            CGRect(x: rect.minX, y: rect.minY, width: overlap.minX - rect.minX, height: rect.height),
+            CGRect(x: overlap.maxX, y: rect.minY, width: rect.maxX - overlap.maxX, height: rect.height),
+            CGRect(x: overlap.minX, y: rect.minY, width: overlap.width, height: overlap.minY - rect.minY),
+            CGRect(x: overlap.minX, y: overlap.maxY, width: overlap.width, height: rect.maxY - overlap.maxY),
+        ]
+        return remainders.allSatisfy { $0.width <= 0 || $0.height <= 0 || isCovered($0, by: rest) }
     }
 
     /// Renders the visible area at full resolution. Requests made while a render is running are coalesced.
@@ -815,22 +1118,64 @@ final class LibraryModel {
             while detailPending {
                 detailPending = false
                 guard let zoom, let photo = activePhoto, photo.id == zoom.photoID else { break }
+                if let prefetching, prefetching.id == photo.id {
+                    // Already being decoded; wait for that rather than decoding it twice.
+                    _ = await prefetching.task.value
+                }
                 let original = showOriginal
+                let settings = original ? EditSettings.default : photo.settings
+                // An edit re-renders everything shown in one go, which Core Image can cache for
+                // the next step of a slider drag; a pan adds the tiles it uncovers.
+                let isPan = isDetailCurrent
+                let rects: [CGRect]
+                if isPan {
+                    let near = missingDetailTiles(in: detailCoverage)
+                    rects = near.isEmpty ? missingDetailTiles(in: detailLead) : near
+                    if rects.isEmpty { continue }
+                } else {
+                    rects = detailViewport.map { [$0] } ?? []  // None yet: only get the size.
+                }
                 let result = await renderer.renderDetail(
                     url: photo.url,
-                    settings: original ? EditSettings.default : photo.settings,
+                    settings: settings,
                     geometry: !original,
-                    rect: detailViewport,
+                    rects: rects,
                     colorSpace: displayColorSpace
                 )
                 guard self.zoom?.photoID == photo.id, let result else { continue }
-                zoomFullSize = result.fullSize
-                if let image = result.image {
-                    detail = DetailImage(photoID: photo.id, image: image, rect: result.rect)
+                if zoomFullSize != result.fullSize { zoomFullSize = result.fullSize }
+                guard !result.pieces.isEmpty else { continue }
+                let pieces = result.pieces.map { DetailImage(photoID: photo.id, image: $0.image, rect: $0.rect) }
+                if isPan {
+                    // After an edit meanwhile, the pending request renders everything again.
+                    guard isDetailCurrent else { continue }
+                    detail = prunedDetail(detail + pieces)
+                    // Then the tiles ahead of the pan, unless something newer is waiting.
+                    if !detailPending, !missingDetailTiles(in: detailLead).isEmpty { detailPending = true }
+                } else {
+                    // Tiles around it are left to the next pan: rendering them now would hold up
+                    // the next step of a slider drag and push this area out of Core Image's cache.
+                    detail = pieces
+                    detailRendering = (settings, original)
                 }
             }
             detailTask = nil
+            schedulePrefetch()
         }
+    }
+
+    /// Drops rendered parts far from the visible area, keeping at most about 40 MP (160 MB).
+    private func prunedDetail(_ pieces: [DetailImage]) -> [DetailImage] {
+        guard let coverage = detailLead else { return pieces }
+        let center = CGPoint(x: coverage.midX, y: coverage.midY)
+        func distance(_ piece: DetailImage) -> CGFloat { hypot(piece.rect.midX - center.x, piece.rect.midY - center.y) }
+        var kept = pieces.filter { $0.rect.intersects(coverage) }
+        var area = kept.reduce(0) { $0 + $1.rect.width * $1.rect.height }
+        while area > 40_000_000, let farthest = kept.indices.max(by: { distance(kept[$0]) < distance(kept[$1]) }) {
+            area -= kept[farthest].rect.width * kept[farthest].rect.height
+            kept.remove(at: farthest)
+        }
+        return kept
     }
 
     // MARK: - Thumbnails
@@ -936,4 +1281,43 @@ final class LibraryModel {
         guard !urls.isEmpty else { return }
         NSWorkspace.shared.activateFileViewerSelecting(urls)
     }
+}
+
+/// A preview render for `LibraryModel`.
+nonisolated struct PreviewRequest: Sendable {
+    let photoID: Photo.ID
+    let url: URL
+    let key: LibraryModel.PreviewKey
+    let sequence: Int
+    /// False when rendering only so that Core Image caches the photo.
+    let showsResult: Bool
+    /// A prefetch of the photo still running, which has the decoded photo.
+    let prefetch: Task<PreviewResult?, Never>?
+}
+
+/// The latest preview request, for the render loop. Requests posted while one is rendering
+/// replace each other, so the loop always goes on with the newest.
+nonisolated final class PreviewQueue: Sendable {
+    private let state = Mutex<(next: PreviewRequest?, isRunning: Bool)>((nil, false))
+
+    /// Returns true when no loop is running, and the caller must start one.
+    func post(_ request: PreviewRequest) -> Bool {
+        state.withLock { state in
+            state.next = request
+            defer { state.isRunning = true }
+            return !state.isRunning
+        }
+    }
+
+    /// The next request, or nil once there's none, which ends the loop.
+    func take() -> PreviewRequest? {
+        state.withLock { state in
+            defer { state.next = nil }
+            if state.next == nil { state.isRunning = false }
+            return state.next
+        }
+    }
+
+    var hasNext: Bool { state.withLock { $0.next != nil } }
+    var isRunning: Bool { state.withLock { $0.isRunning } }
 }

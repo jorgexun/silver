@@ -43,14 +43,15 @@ private struct PreviewCanvas: View {
 
     var body: some View {
         let preview = library.preview?.photoID == photo.id ? library.preview : nil
-        let image = preview?.image ?? photo.thumbnail
+        let placeholder = library.placeholder?.photoID == photo.id ? library.placeholder : nil
+        let image = preview?.image ?? placeholder?.image ?? photo.thumbnail
         let isZoomed = library.zoom?.photoID == photo.id
         Group {
             if let zoom = library.zoom, isZoomed {
                 ZoomedCanvas(zoom: zoom, base: image, dragStart: $panStart, tracker: zoomed) { frame in
                     guard animatesZoomIn else { return }
                     animatesZoomIn = false
-                    transition = ZoomTransition(base: image, detail: nil, frame: frame, zoomingIn: true)
+                    transition = ZoomTransition(base: image, detail: [], frame: frame, zoomingIn: true)
                 }
                 .id(zoom.photoID)  // Fresh scroll state for each photo.
             } else {
@@ -68,10 +69,10 @@ private struct PreviewCanvas: View {
         .onChange(of: isZoomed) { _, isZoomed in
             transition = nil
             if isZoomed {
-                zoomed.detail = nil
+                zoomed.detail = []
                 animatesZoomIn = !reduceMotion
             } else if !reduceMotion, let frame = zoomed.frame {
-                let detail = zoomed.detail?.photoID == photo.id ? zoomed.detail : nil
+                let detail = zoomed.detail.filter { $0.photoID == photo.id }
                 transition = ZoomTransition(base: image, detail: detail, frame: frame, zoomingIn: false)
             }
         }
@@ -168,10 +169,10 @@ private struct ZoomedCanvas: View {
                                 .interpolation(.high)
                                 .frame(width: content.width, height: content.height)
                         }
-                        if let detail = library.detail, detail.photoID == zoom.photoID {
-                            Image(decorative: detail.image, scale: displayScale)
+                        ForEach(library.detail.filter { $0.photoID == zoom.photoID }) { piece in
+                            Image(decorative: piece.image, scale: displayScale)
                                 .interpolation(.none)
-                                .offset(x: detail.rect.minX / displayScale, y: detail.rect.minY / displayScale)
+                                .offset(x: piece.rect.minX / displayScale, y: piece.rect.minY / displayScale)
                         }
                     }
                     .frame(width: content.width, height: content.height, alignment: .topLeading)
@@ -214,8 +215,9 @@ private struct ZoomedCanvas: View {
                     )
                     library.setZoomViewport(visible)
                 }
-                .onChange(of: library.detail.map { ObjectIdentifier($0.image) }) {
-                    if let detail = library.detail, detail.photoID == zoom.photoID { tracker.detail = detail }
+                .onChange(of: library.detail.map(\.id)) {
+                    let detail = library.detail.filter { $0.photoID == zoom.photoID }
+                    if !detail.isEmpty { tracker.detail = detail }
                 }
                 .onAppear {
                     guard !didScrollToFocus else { return }
@@ -293,14 +295,14 @@ private struct ZoomedFrame {
 /// view state, like `ScrollTracker`: it changes on every frame of a scroll.
 private final class ZoomedTracker {
     var frame: ZoomedFrame?
-    var detail: DetailImage?
+    var detail: [DetailImage] = []
 }
 
 private struct ZoomTransition {
     let id = UUID()
     let base: CGImage?
-    /// Full-resolution area shown when zooming out, so the image doesn't turn soft as it starts.
-    let detail: DetailImage?
+    /// Full-resolution areas shown when zooming out, so the image doesn't turn soft as it starts.
+    let detail: [DetailImage]
     let frame: ZoomedFrame
     let zoomingIn: Bool
 }
@@ -325,12 +327,12 @@ private struct ZoomTransitionView: View {
                         .resizable()
                         .interpolation(.high)
                 }
-                if let detail = transition.detail {
-                    Image(decorative: detail.image, scale: 1)
+                ForEach(transition.detail) { piece in
+                    Image(decorative: piece.image, scale: 1)
                         .resizable()
                         .interpolation(.high)
-                        .frame(width: detail.rect.width / displayScale, height: detail.rect.height / displayScale)
-                        .offset(x: detail.rect.minX / displayScale, y: detail.rect.minY / displayScale)
+                        .frame(width: piece.rect.width / displayScale, height: piece.rect.height / displayScale)
+                        .offset(x: piece.rect.minX / displayScale, y: piece.rect.minY / displayScale)
                 }
             }
             .frame(width: zoomed.width, height: zoomed.height, alignment: .topLeading)

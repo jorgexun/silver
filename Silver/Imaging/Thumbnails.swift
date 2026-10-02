@@ -18,6 +18,27 @@ nonisolated enum Thumbnails {
         return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
     }
 
+    /// The file's embedded preview at screen size, in `colorSpace` and Core Animation's BGRA
+    /// layout, to show while the photo itself is decoded: about 0.15 s instead of 0.8 s for M11
+    /// files. Drawn on the CPU so it doesn't wait for a Core Image context busy decoding.
+    static func screenPreview(url: URL, maxPixelSize: CGFloat, colorSpace: CGColorSpace) -> CGImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary),
+              let context = CGContext(
+                  data: nil, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: 0, space: colorSpace,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+              )
+        else { return nil }
+        context.interpolationQuality = .none  // Same size: just color conversion.
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return context.makeImage()
+    }
+
     /// Thumbnail rendered through the edit pipeline.
     static func rendered(url: URL, settings: EditSettings) -> CGImage? {
         // Oversample 2x for a crisper downscale.

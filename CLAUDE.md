@@ -34,6 +34,9 @@ Views can be checked the same way, without a display:
 - Events sent with `window.sendEvent` don't set `NSApp.currentEvent`, where the crop editor reads modifier keys from. Queue those drags with `NSApp.postEvent` to test ⇧, ⌥ and ⌘.
 - Menu commands aren't in the harness. Test them on the app itself with `CGEvent.postToPid`, which reaches a background instance without touching the frontmost app.
 - Glass and sidebar vibrancy don't render this way.
+- Drive the harness from a `Task { @MainActor in … }` that waits with `Task.sleep`. Pumping `RunLoop` inside `DispatchQueue.main.async` never runs the model's main-actor tasks.
+- Synthetic drags and scroll-wheel events didn't reach the zoomed `ScrollView`. To pan at 100%, find its `NSScrollView` and move the clip view (`contentView.scroll(to:)` plus `reflectScrolledClipView`), kept within the document.
+- `xcrun xctrace record --template 'Time Profiler' --launch -- <harness>` profiles a harness run; `xctrace export` gives the samples as XML.
 
 ## Project setup gotchas
 
@@ -49,7 +52,7 @@ Views can be checked the same way, without a display:
 - the open folder, selection and active photo
 - view mode and the crop session
 - an app-level undo/redo stack (not `UndoManager`)
-- the coalescing preview render loop and the thumbnail queue
+- preview rendering (see Loading and editing photos) and the thumbnail queue
 - debounced sidecar saves, via `flushSaves()` on folder change and app termination
 
 `SourceFolders` manages the sidebar. Root folders are persisted as security-scoped bookmarks. Subfolders are listed lazily on expand. Roots on disconnected volumes are kept as unavailable and re-checked on mount, unmount and app activation. Folder URLs are compared after `SourceFolders.normalized(_:)`, because `URL` equality treats trailing-slash differences as unequal.
@@ -74,8 +77,17 @@ JPEG sources use `CITemperatureAndTint` for white balance and the same kernel wi
 
 `research.md` surveys how Adobe, Apple, darktable and RawTherapee design these curves, with measurements.
 
-**100% zoom.** Clicking the loupe image or pressing Z toggles `LibraryModel.zoom`. Switching photos while zoomed stays at 100% at the same relative position (`zoomCenter`), for comparing focus across a burst. The zoomed view is a `ScrollView` sized to the full-resolution output. The fit preview is stretched underneath as a placeholder, and on top `PreviewRenderer.renderDetail` renders only the visible area (plus a margin) at full resolution. While zoomed, edits re-render just that area; the fit preview is refreshed on exit. Rendering both sizes at once would flip the shared RAW decoder's scale back and forth.
-- The margin is up to 256 px, kept within a 14 MP region budget. Core Image keeps the decoded RAW cached only for regions up to about 16 MP. Past that, every edit decodes again: on a 5K window, about 150 ms per edit instead of about 10 ms.
+**Loading and editing photos.** Opening a 60 MP M11 DNG takes about 0.8 s: 0.1 s to create the `CIRAWFilter`, 0.6 s of single-threaded decompression on the CPU, and 0.15 s of demosaicing on the GPU. The decompressed RAW stays in the `CIRAWFilter`, so later renders of the same `SourceImage`, in any context or at any scale, cost only the GPU part. A `CIContext` runs one render at a time, and a second context costs up to 2 GB.
+- `PreviewRenderer` keeps 5 decoded sources (about 190 MB each). Its `prefetch` decodes a photo and renders its preview on a separate low-priority context without caching intermediates, then hands the source to the actor. Prefetching doesn't hold up renders of the photo being edited.
+- `LibraryModel` keeps a small preview cache (one entry per photo and kind, with or without crop), keyed by settings, pixel size and color space. Photos next to the active one in the loupe, or the selected one in the grid (after 0.3 s), are prefetched into it once the active photo has rendered, so stepping through photos shows them at once. Cached previews also make `\` and undo instant. After showing a cached preview, the photo is rendered again in the preview's context while nothing waits on it, so the first slider step is fast.
+- Until an unedited RAW photo has rendered, the loupe shows its embedded camera JPEG at screen size (`Thumbnails.screenPreview`, about 0.15 s), not the small thumbnail. Edited photos show their thumbnail, which has the edits.
+- When photos are stepped through faster than every 0.25 s, decoding waits until stepping pauses for 0.2 s. A decode can't be stopped, so decoding each photo passed would hold up the one the user stops at.
+- Preview renders run in a loop off the main actor that takes the newest request from `PreviewQueue`. A render therefore starts as soon as an edit asks for it, not after the main actor has updated the views for that edit, which used to add 5–25 ms per slider step.
+- `Photo.isEdited` is stored and changes only when it flips. Menus, the grid and the filmstrip read it, so a slider step doesn't update them.
+
+**100% zoom.** Clicking the loupe image or pressing Z toggles `LibraryModel.zoom`. Switching photos while zoomed stays at 100% at the same relative position (`zoomCenter`), for comparing focus across a burst. The zoomed view is a `ScrollView` sized to the full-resolution output. The fit preview is stretched underneath as a placeholder, and on top `PreviewRenderer.renderDetail` renders full-resolution pieces (`LibraryModel.detail`). While zoomed, edits re-render only at 100%; the fit preview is refreshed on exit. Rendering both sizes at once would flip the shared RAW decoder's scale back and forth.
+- An edit renders the visible area plus a margin as one piece, replacing the others. The margin is up to 256 px, kept within a 14 MP region budget. Core Image keeps the decoded RAW cached only for regions up to about 16 MP. Past that, every edit decodes again: on a 5K window, about 150 ms per edit instead of about 10 ms.
+- A pan adds 512 px tiles where the rendered pieces don't cover the visible area plus 256 px, then tiles ahead of the pan (up to two). A column of tiles takes about 15 ms; re-rendering the whole area took about 80 ms. A tile counts as covered when the union of the pieces covers it. Tiles and whole-area renders match within one 8-bit level, so there are no seams.
 - Zooming in or out from a click or Z animates with an overlay (`ZoomTransitionView`) that scales the preview between its fit frame and its 100% frame, then reveals the real view. The two views can't animate into each other: the scroll view only draws what's visible at 100%. Switching photos while zoomed doesn't animate. The overlay uses a timing curve, not a spring: a spring's completion fires in its tail, so removing the overlay then shows a jump.
 - The scroll view extends under the sidebar, inspector and toolbar as content insets. `scrollTo(point:)` takes the top-left of the visible area, which is `contentOffset` plus the leading and top insets, not `visibleRect.origin`.
 
@@ -84,8 +96,8 @@ JPEG sources use `CITemperatureAndTint` for white balance and the same kernel wi
 - `bitmap` renders on the actor, in the screen's color space and in BGRA. Otherwise Core Animation converts every pixel on the CPU at commit while the main thread waits, about 40 ms for 14 MP.
 
 **Thumbnails and export.**
-- Thumbnails show the file's embedded preview first. Edited photos are re-rendered through the pipeline one at a time, because full RAW decodes don't parallelize and are memory heavy.
-- The active photo's thumbnail is refreshed from the preview render once edits pause (no newer render pending), not on every step of a slider drag.
+- Thumbnails show the file's embedded preview first. Edited photos are re-rendered through the pipeline one at a time: renders on one context don't run in parallel, and another context would cost up to 2 GB.
+- A photo's thumbnail is refreshed from its preview render once preview renders pause for 0.3 s, also after moving on to another photo. Refreshing it after each render made every other slider step wait about 30 ms for the downscale.
 - Export runs jobs sequentially in `Task.detached`. It writes sRGB JPEGs with a whitelisted subset of the original EXIF/GPS/TIFF metadata and orientation 1.
 
 **UI conventions.** Shared controls live in `Views/Controls.swift`.

@@ -39,16 +39,25 @@ nonisolated enum ToneMapping {
         ) ?? image
     }
 
-    private static func makeTable(_ f: (Double) -> Double) -> CIImage {
+    /// Scene values the table entries are sampled at.
+    private static let sampleInputs: [Double] = {
         let maxEncoded = pow(domain, encodePower)
-        var values: [Float] = []
-        values.reserveCapacity(samples * 4)
-        for i in 0..<samples {
-            let x = pow(maxEncoded * Double(i) / Double(samples - 1), 1 / encodePower)
-            let y = Float(min(max(f(x), 0), 1))
-            values += [y, y, y, 1]
+        return (0..<samples).map { pow(maxEncoded * Double($0) / Double(samples - 1), 1 / encodePower) }
+    }()
+
+    private static func makeTable(_ f: (Double) -> Double) -> CIImage {
+        // Built on every step of a slider drag, so it writes into one buffer.
+        var data = Data(count: samples * 16)
+        data.withUnsafeMutableBytes { raw in
+            let values = raw.bindMemory(to: Float.self)
+            for (i, x) in sampleInputs.enumerated() {
+                let y = Float(min(max(f(x), 0), 1))
+                values[i * 4] = y
+                values[i * 4 + 1] = y
+                values[i * 4 + 2] = y
+                values[i * 4 + 3] = 1
+            }
         }
-        let data = values.withUnsafeBufferPointer { Data(buffer: $0) }
         // No color space: the values are used as-is, without color management.
         return CIImage(bitmapData: data, bytesPerRow: samples * 16, size: CGSize(width: samples, height: 1), format: .RGBAf, colorSpace: nil)
     }
@@ -108,8 +117,9 @@ nonisolated enum ToneMapping {
         let top = white * gain
         let amount = highlightAmount(highlights)
         let midGray = encode(base(0.18, white: baseWhite))
+        let darken = NegativeExposure(exposure)
         return { x in
-            var v = exposure < 0 ? white * negativeExposure(x / white, exposure) : x * gain
+            var v = exposure < 0 ? white * darken(x / white) : x * gain
             v = shiftHighlights(v, amount: amount, top: top)
             return applyContrast(base(v, white: top), contrast, pivot: midGray)
         }
@@ -122,7 +132,6 @@ nonisolated enum ToneMapping {
         guard x < white else { return 1 }
         // Rational shoulder r(u) = (1 + c)u / (u + c) on u ∈ [0, 1]: r(0) = 0, r(1) = 1, and
         // r'(0) continues the base curve's slope at the knee.
-        let kneeValue = interpolate(appleCurve, at: baseKnee)
         let span = white - baseKnee
         let startSlope = baseKneeSlope * span / (1 - kneeValue)  // > 1 for any white ≥ baseWhite
         let c = 1 / (startSlope - 1)
@@ -132,6 +141,7 @@ nonisolated enum ToneMapping {
 
     private static let baseKnee = 0.46
     private static let baseKneeSlope = 0.86
+    private static let kneeValue = interpolate(appleCurve, at: baseKnee)
     /// Where Core Image's default curve itself reaches white; the smallest allowed white point.
     static let baseWhite = 1.0746
 
@@ -163,10 +173,11 @@ nonisolated enum ToneMapping {
 
     private static func bitmapCurve(exposure: Double, highlights: Double, contrast: Double) -> (Double) -> Double {
         let gain = pow(2, max(exposure, 0))
+        let darken = NegativeExposure(exposure)
         return { x in
             var y: Double
             if exposure < 0 {
-                y = negativeExposure(min(x, 1), exposure)
+                y = darken(min(x, 1))
             } else {
                 // Values pushed above white roll off instead of clipping.
                 let v = x * gain
@@ -186,14 +197,21 @@ nonisolated enum ToneMapping {
 
     /// Adobe's negative-exposure curve (`dng_function_exposure_tone`): linear darkening below a
     /// quarter of white, then a quadratic that still maps white to white.
-    private static func negativeExposure(_ x: Double, _ exposure: Double) -> Double {
-        let slope = pow(2, exposure)
-        let a = 16.0 / 9.0 * (1 - slope)
-        let b = slope - 0.5 * a
-        let c = 1 - a - b
-        guard x > 0.25 else { return x * slope }
-        guard x < 1 else { return x }
-        return (a * x + b) * x + c
+    private struct NegativeExposure {
+        let slope, a, b, c: Double
+
+        init(_ exposure: Double) {
+            slope = pow(2, exposure)
+            a = 16.0 / 9.0 * (1 - slope)
+            b = slope - 0.5 * a
+            c = 1 - a - b
+        }
+
+        func callAsFunction(_ x: Double) -> Double {
+            guard x > 0.25 else { return x * slope }
+            guard x < 1 else { return x }
+            return (a * x + b) * x + c
+        }
     }
 
     /// Slider value (-100...100) to Highlights strength. Limits keep the curve monotonic:
