@@ -96,7 +96,10 @@ struct TrackSlider: View {
                 ))
             case .plain, .ruler:
                 context.fill(track, with: .color(.white.opacity(0.14)))
-                let a = scale.x(origin), b = scale.x(value)
+                // Values sit inset by half the knob; a fill from an end of the range starts at the
+                // end of the track, so it doesn't leave that inset empty.
+                let a = origin <= range.lowerBound ? bar.minX : origin >= range.upperBound ? bar.maxX : scale.x(origin)
+                let b = scale.x(value)
                 var filled = context
                 filled.clip(to: Path(CGRect(x: min(a, b), y: bar.minY, width: abs(b - a), height: height)))
                 filled.fill(track, with: .color(.white.opacity(0.62)))
