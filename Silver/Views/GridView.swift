@@ -147,11 +147,11 @@ struct PhotoContextMenu: View {
         Button(count > 1 ? "Paste Adjustments to \(count) Photos" : "Paste Adjustments") {
             library.pasteAdjustments(to: targets)
         }
-        .disabled(library.clipboard == nil)
+        .disabled(library.clipboard == nil || library.isCropping)
         Button(count > 1 ? "Reset \(count) Photos" : "Reset Adjustments") {
             library.resetAdjustments(of: targets)
         }
-        .disabled(targets.allSatisfy { !$0.isEdited })
+        .disabled(targets.allSatisfy { !$0.isEdited } || library.isCropping)
         Divider()
         Button(count > 1 ? "Export \(count) Photos…" : "Export Photo…") { library.exportPhotos(targets) }
         Button("Show in Finder") {

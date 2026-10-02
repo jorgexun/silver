@@ -110,7 +110,7 @@ struct SilverCommands: Commands {
                     // Pastes onto every selected photo, as Paste Edits does in Photos.
                     Button(targets > 1 ? "Paste Adjustments to \(targets) Photos" : "Paste Adjustments") { library.pasteAdjustments() }
                         .keyboardShortcut("v")
-                        .disabled(!library.canPaste)
+                        .disabled(!library.canPaste || library.isCropping)
                 }
                 Divider()
                 Button("Select All") { library.selectAll() }
@@ -165,7 +165,7 @@ struct SilverCommands: Commands {
                 Divider()
                 Button(targets > 1 ? "Reset \(targets) Photos" : "Reset Adjustments") { library.resetAdjustments() }
                     .keyboardShortcut("r", modifiers: [.command, .shift, .option])
-                    .disabled(targetPhotos.allSatisfy { !$0.isEdited })
+                    .disabled(targetPhotos.allSatisfy { !$0.isEdited } || library.isCropping)
             }
             .disabled(noWindow)
         }

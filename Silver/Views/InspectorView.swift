@@ -14,10 +14,13 @@ struct InspectorView: View {
                     } else {
                         GeometrySection(photo: photo)
                     }
-                    // The same groups as Copy Adjustments… offers.
-                    AdjustmentSection(title: "Light", adjustments: Adjustment.light, photo: photo)
-                    AdjustmentSection(title: "White Balance", adjustments: Adjustment.whiteBalance, photo: photo)
-                    AdjustmentSection(title: "Color", adjustments: Adjustment.color, photo: photo)
+                    // The same groups as Copy Adjustments… offers. Cropping edits only the crop.
+                    Group {
+                        AdjustmentSection(title: "Light", adjustments: Adjustment.light, photo: photo)
+                        AdjustmentSection(title: "White Balance", adjustments: Adjustment.whiteBalance, photo: photo)
+                        AdjustmentSection(title: "Color", adjustments: Adjustment.color, photo: photo)
+                    }
+                    .disabled(library.isCropping)
                 }
                 .padding(16)
             }
@@ -183,6 +186,8 @@ struct AdjustmentSlider: View {
     /// Applies a typed value, clamped to the range.
     let onCommit: (Double) -> Void
 
+    @Environment(\.isEnabled) private var isEnabled
+
     var body: some View {
         VStack(spacing: 3) {
             HStack(alignment: .firstTextBaseline) {
@@ -197,9 +202,12 @@ struct AdjustmentSlider: View {
                 }
             }
             .font(.callout)
+            .opacity(isEnabled ? 1 : 0.4)
 
             TrackSlider(value: $value, range: range, origin: 0, style: style, onEditingChanged: onEditingChanged, onReset: onReset)
         }
+        // The value and the track react to taps and drags, which `disabled` alone doesn't stop.
+        .allowsHitTesting(isEnabled)
     }
 }
 
@@ -290,7 +298,7 @@ private struct PhotoInfoHeader: View {
                     // Resetting several photos is in the Photo menu.
                     Button("Reset") { library.resetActive(.all, actionName: "Reset Adjustments") }
                         .controlSize(.small)
-                        .disabled(!photo.isEdited)
+                        .disabled(!photo.isEdited || library.isCropping)
                         .help("Reset This Photo's Adjustments")
                 }
                 if let metadata = photo.metadata {
