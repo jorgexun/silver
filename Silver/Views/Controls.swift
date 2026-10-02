@@ -70,6 +70,8 @@ struct TrackSlider: View {
             })
         }
         .frame(height: 16)
+        // Faded as one layer, so the knob still covers the track instead of showing it through.
+        .compositingGroup()
         .opacity(isEnabled ? 1 : 0.4)
         // A drag that ends without `onEnded`, e.g. when the inspector closes mid-drag, must still
         // end the edit, or the model would keep treating later edits as part of it.
