@@ -18,6 +18,12 @@ struct ContentView: View {
                 }
                 .toolbar { toolbar }
         }
+        .onAppear { library.isWindowOpen = true }
+        // Closing the window keeps the app running, so write pending edits now.
+        .onDisappear {
+            library.isWindowOpen = false
+            library.flushSaves()
+        }
         .navigationTitle(library.folderURL?.lastPathComponent ?? "Silver")
         .navigationSubtitle(subtitle)
         .sheet(isPresented: $export.isPresented) {

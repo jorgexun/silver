@@ -53,7 +53,7 @@ Views can be checked the same way, without a display:
 - view mode and the crop session
 - an app-level undo/redo stack (not `UndoManager`)
 - preview rendering (see Loading and editing photos) and the thumbnail queue
-- debounced sidecar saves, via `flushSaves()` on folder change and app termination
+- debounced sidecar saves, flushed (`flushSaves()`) on folder change, window close and app termination
 
 `SourceFolders` manages the sidebar. Root folders are persisted as security-scoped bookmarks. Subfolders are listed lazily on expand. Roots on disconnected volumes are kept as unavailable and re-checked on mount, unmount and app activation. Folder URLs are compared after `SourceFolders.normalized(_:)`, because `URL` equality treats trailing-slash differences as unequal.
 

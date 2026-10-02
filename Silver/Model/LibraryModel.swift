@@ -72,6 +72,9 @@ final class LibraryModel {
     /// Columns the grid shows at its width and thumbnail size, for moving up and down by row.
     var gridColumns = 1
     var isInspectorPresented = true
+    /// Closing the window keeps the app running; menu commands are off until it reopens, so
+    /// they can't change photos out of sight.
+    var isWindowOpen = true
     /// The inspector field a value is being typed into. Single-key shortcuts are off meanwhile,
     /// so the keys reach the field.
     var valueEditor: UUID?
