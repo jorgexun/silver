@@ -59,21 +59,25 @@ Views can be checked the same way, without a display:
 
 **Edits.** `EditSettings` is the whole per-photo edit. It is written by `Sidecar` to `<base>.edit.json` next to the original. The sidecar is deleted when settings return to default. When a DNG and a JPG share a base name, the JPG uses `<name>.JPG.edit.json`. Decoding clamps every value to its slider range. Crop rects are normalized, top-left origin, and live in the straightened frame. A positive straighten angle rotates clockwise on screen. `CropGeometry` keeps crops inside the rotated image.
 
-**Rendering.** One recipe, `ImagePipeline.render`, serves the preview (`PreviewRenderer` actor), thumbnails (`Thumbnails`) and export (`Exporter`). Preview and export must match, so changes belong in the shared path.
+**Rendering.** One recipe, `ImagePipeline.render`, serves the preview (`PreviewRenderer` actor), thumbnails (`Thumbnails`) and export (`Exporter`). Preview and export must match, so changes belong in the shared path. It takes the `CIContext` that will render the result, which also renders the local tone coefficients.
 
 1. `SourceImage` wraps one decode and is not thread-safe.
    - DNGs use `CIRAWFilter` with `boostAmount = 0` and `extendedDynamicRangeAmount = 2`. That gives scene-linear data with highlight headroom above 1.0. White balance is applied in the RAW filter.
    - The decode size follows the crop, so tight crops aren't upscaled in the preview.
-2. `ToneMapping` builds one lookup table per combination of exposure, Highlights and Contrast. The `rgbTone` Metal kernel applies it the way Adobe's DNG SDK does (`RefBaselineRGBTone`): largest and smallest channels through the curve, middle channel interpolated. That preserves hue, while saturation follows the curve's slope.
+2. `ToneMapping` builds one lookup table per combination of exposure and Contrast. The `rgbTone` Metal kernel applies it the way Adobe's DNG SDK does (`RefBaselineRGBTone`): largest and smallest channels through the curve, middle channel interpolated. That preserves hue, while saturation follows the curve's slope.
    - Shadows and midtones follow a curve measured from Core Image's default RAW rendering, which matches Adobe's ACR3 default within one 8-bit level. A shoulder then reaches display white exactly at a fixed scene white, `ToneMapping.sceneWhite`.
    - Scene white is 6.0, which covers the highlight headroom seen in M11 files; clipped areas render at 249–254. A per-image measured white point was tried and rejected: it cost about 0.12 s per photo opened or exported.
    - Positive exposure scales the image and white point together. Negative exposure uses Adobe's white-preserving curve.
-   - Highlights reshapes tones between a pivot (0.3) and white in log space, leaving both ends fixed.
-   - Contrast is an S-curve in gamma space around mid-gray. Both Highlights and Contrast are folded into the same table.
-3. `ImagePipeline.applyTone` handles shadows (`CIHighlightShadowAdjust`, global), vibrance and saturation, plus negative Highlights for JPEGs only.
-4. `applyGeometry` applies straighten, then crop, in Core Image's y-up coordinates.
+   - Contrast is an S-curve in gamma space around mid-gray, folded into the same table.
+3. Highlights and Shadows are local: before the curve, `rgbToneLocal` multiplies each pixel by 2^Δ, where Δ depends on an edge-aware local average of log2 luminance. Regions move as a whole, so detail keeps its contrast, and all channels get the same gain, so hue is kept. Design and measurements are in `research.md` appendix B.
+   - The average is a self-guided filter (`LocalTone`) run at 512 px. Its coefficients (a, b) are scaled up and combined with full-resolution luminance (`a · L + b`), so it follows edges at full resolution.
+   - The coefficients depend only on the photo and its white balance, not on exposure or the two sliders. `SourceImage` caches them per white balance. They are computed from a fixed 1024 px decode (the RAW filter's scale changes for a moment), so preview, thumbnails, 100% tiles and export get the same ones. Never compute them inside a tile render: their region of interest is the whole image.
+   - The kernel computes Δ itself: Highlights −100 halves the distance of bright regions above mid gray (after exposure), in stops; Shadows +100 halves it for dark regions below, up to 2 stops.
+   - With both at 0, the plain `rgbTone` kernel runs and nothing else is computed.
+4. `ImagePipeline.applyColor` handles vibrance and saturation.
+5. `applyGeometry` applies straighten, then crop, in Core Image's y-up coordinates.
 
-JPEG sources use `CITemperatureAndTint` for white balance and the same kernel with a display-referred table: exposure (with a soft shoulder when raised), positive Highlights, and Contrast. With no adjustments they pass through untouched.
+JPEG sources use `CITemperatureAndTint` for white balance and the same kernels with a display-referred table: exposure (with a shoulder that reaches white when raised) and Contrast, plus the same local Highlights and Shadows (coefficients from a 1024 px decode of the JPEG). With no adjustments they pass through untouched.
 
 `research.md` surveys how Adobe, Apple, darktable and RawTherapee design these curves, with measurements.
 

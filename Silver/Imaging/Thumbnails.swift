@@ -44,7 +44,7 @@ nonisolated enum Thumbnails {
         // Oversample 2x for a crisper downscale.
         guard let source = SourceImage(url: url, maxPixelSize: maxPixelSize * 2) else { return nil }
         source.ensureLongEdge(source.longEdgeNeeded(for: settings.crop, outputPixelSize: maxPixelSize * 2))
-        guard let (image, _) = ImagePipeline.render(source, settings: settings, geometry: true)
+        guard let (image, _) = ImagePipeline.render(source, settings: settings, geometry: true, context: context)
         else { return nil }
         return downscale(image, maxPixelSize: maxPixelSize, context: context)
     }

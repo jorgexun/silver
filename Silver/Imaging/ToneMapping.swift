@@ -2,10 +2,11 @@ import CoreImage
 import Foundation
 import Synchronization
 
-/// Tone mapping: exposure, the base tone curve, Highlights and Contrast, combined into one
-/// curve that `ToneKernels.metal` applies with Adobe's hue-preserving `RGBTone` method.
+/// Tone mapping: exposure, the base tone curve and Contrast, combined into one curve that
+/// `ToneKernels.metal` applies with Adobe's hue-preserving `RGBTone` method, after the local
+/// exposure change of Highlights and Shadows.
 ///
-/// The curve is evaluated on the CPU into a lookup table (an image one pixel high), so any
+/// The curves are evaluated on the CPU into lookup tables (images one pixel high), so any
 /// combination of settings costs a single kernel pass on the GPU.
 nonisolated enum ToneMapping {
     // MARK: Lookup table
@@ -21,21 +22,50 @@ nonisolated enum ToneMapping {
     /// separately built `.metallib` before first use.
     nonisolated(unsafe) static var metalLibraryURL = Bundle.main.url(forResource: "default", withExtension: "metallib")
 
-    private static let kernel: CIKernel? = {
-        guard let url = metalLibraryURL, let data = try? Data(contentsOf: url) else { return nil }
-        return try? CIKernel(functionName: "rgbTone", fromMetalLibraryData: data)
-    }()
+    private static let metalLibrary: Data? = metalLibraryURL.flatMap { try? Data(contentsOf: $0) }
 
-    private static func apply(_ table: CIImage, to image: CIImage) -> CIImage {
-        guard let kernel else {
-            assertionFailure("rgbTone kernel is missing from the Metal library")
+    static func kernel(_ name: String) -> CIKernel? {
+        metalLibrary.flatMap { try? CIKernel(functionName: name, fromMetalLibraryData: $0) }
+    }
+
+    static func colorKernel(_ name: String) -> CIColorKernel? {
+        metalLibrary.flatMap { try? CIColorKernel(functionName: name, fromMetalLibraryData: $0) }
+    }
+
+    private static let kernels = kernel("rgbTone").flatMap { global in kernel("rgbToneLocal").map { (global: global, local: $0) } }
+
+    /// Applies `table`, after the local exposure change of `local` if there is one.
+    private static func apply(_ table: CIImage, to image: CIImage, exposure: Double, local: LocalAdjustment?) -> CIImage {
+        guard let kernels else {
+            assertionFailure("Tone kernels are missing from the Metal library")
             return image
         }
+        let extent = image.extent
         let tableExtent = table.extent
-        return kernel.apply(
-            extent: image.extent,
-            roiCallback: { index, rect in index == 0 ? rect : tableExtent },
-            arguments: [image, table, Float(pow(domain, encodePower)), Float(samples)]
+        let maxEncoded = Float(pow(domain, encodePower))
+        guard let local else {
+            return kernels.global.apply(
+                extent: extent,
+                roiCallback: { index, rect in index == 0 ? rect : tableExtent },
+                arguments: [image, table, maxEncoded, Float(samples)]
+            ) ?? image
+        }
+        // Stretch the coefficients over the image; they are sampled bilinearly.
+        let small = local.coefficients.extent
+        let coefficients = local.coefficients
+            .clampedToExtent()
+            .samplingLinear()
+            .transformed(by: CGAffineTransform(translationX: extent.minX, y: extent.minY)
+                .scaledBy(x: extent.width / small.width, y: extent.height / small.height)
+                .translatedBy(x: -small.minX, y: -small.minY))
+        return kernels.local.apply(
+            extent: extent,
+            roiCallback: { index, rect in index == 0 ? rect : index == 1 ? rect.insetBy(dx: -1, dy: -1) : tableExtent },
+            arguments: [
+                image, coefficients, table, maxEncoded, Float(samples), Float(exposure - log2(0.18)),
+                Float(clamp(local.highlights, -100, 100) / 100 * localStrength),
+                Float(clamp(local.shadows, -100, 100) / 100 * localStrength),
+            ]
         ) ?? image
     }
 
@@ -67,8 +97,8 @@ nonisolated enum ToneMapping {
     private static let tableCacheLimit = 32
 
     private enum TableKey: Hashable {
-        case raw(exposure: Int, highlights: Int, contrast: Int)
-        case bitmap(exposure: Int, highlights: Int, contrast: Int)
+        case raw(exposure: Int, contrast: Int)
+        case bitmap(exposure: Int, contrast: Int)
     }
 
     private static func table(for key: TableKey, _ f: () -> (Double) -> Double) -> CIImage {
@@ -87,19 +117,25 @@ nonisolated enum ToneMapping {
         return table
     }
 
+    // MARK: - Highlights and Shadows
+
+    /// Highlights −100 halves the distance in stops of bright regions above mid gray (after
+    /// exposure), and Shadows +100 halves it for dark regions below, up to 2 stops. Positions
+    /// relative to mid gray make the same settings reach further on photos with a wider range.
+    /// Both fade in over their first stop from mid gray (see `rgbToneLocal`).
+    private static let localStrength = 0.5
+
     // MARK: - RAW
 
     /// Develops scene-linear RAW output (white balance applied, highlight headroom kept) for display.
-    static func raw(_ image: CIImage, exposure: Double, highlights: Double, contrast: Double) -> CIImage {
+    static func raw(_ image: CIImage, exposure: Double, contrast: Double, local: LocalAdjustment?) -> CIImage {
         // Quantize to the cache key so equal keys always produce equal tables.
         let exposureKey = Int((clamp(exposure, -5, 5) * 100).rounded())
-        let highlightsKey = Int(clamp(highlights, -100, 100).rounded())
         let contrastKey = Int(clamp(contrast, -100, 100).rounded())
-        let key = TableKey.raw(exposure: exposureKey, highlights: highlightsKey, contrast: contrastKey)
-        let table = table(for: key) {
-            rawCurve(exposure: Double(exposureKey) / 100, highlights: Double(highlightsKey), contrast: Double(contrastKey))
+        let table = table(for: .raw(exposure: exposureKey, contrast: contrastKey)) {
+            rawCurve(exposure: Double(exposureKey) / 100, contrast: Double(contrastKey))
         }
-        return apply(table, to: image)
+        return apply(table, to: image, exposure: Double(exposureKey) / 100, local: local)
     }
 
     /// Scene value (at exposure 0) that becomes display white. Fixed rather than measured per image:
@@ -109,18 +145,16 @@ nonisolated enum ToneMapping {
     static let sceneWhite = 6.0
 
     /// Scene value → display value for RAW files.
-    private static func rawCurve(exposure: Double, highlights: Double, contrast: Double) -> (Double) -> Double {
+    private static func rawCurve(exposure: Double, contrast: Double) -> (Double) -> Double {
         let white = sceneWhite
         let gain = pow(2, max(exposure, 0))
         // Positive exposure moves the white point up with the image; negative exposure keeps it,
         // so clipped highlights stay white while the rest darkens (as in Adobe's DNG SDK).
         let top = white * gain
-        let amount = highlightAmount(highlights)
         let midGray = encode(base(0.18, white: baseWhite))
         let darken = NegativeExposure(exposure)
         return { x in
-            var v = exposure < 0 ? white * darken(x / white) : x * gain
-            v = shiftHighlights(v, amount: amount, top: top)
+            let v = exposure < 0 ? white * darken(x / white) : x * gain
             return applyContrast(base(v, white: top), contrast, pivot: midGray)
         }
     }
@@ -157,37 +191,35 @@ nonisolated enum ToneMapping {
 
     // MARK: - JPEG
 
-    /// Exposure, Highlights (positive only; negative uses CIHighlightShadowAdjust) and Contrast
-    /// for already-rendered images. Returns the input unchanged when there is nothing to do.
-    static func bitmap(_ image: CIImage, exposure: Double, highlights: Double, contrast: Double) -> CIImage {
+    /// Exposure, Contrast, Highlights and Shadows for already-rendered images, which are treated
+    /// like scene values with white at 1. Returns the input unchanged when there is nothing to do.
+    static func bitmap(_ image: CIImage, exposure: Double, contrast: Double, local: LocalAdjustment?) -> CIImage {
         let exposureKey = Int((clamp(exposure, -5, 5) * 100).rounded())
-        let highlightsKey = Int(clamp(highlights, 0, 100).rounded())
         let contrastKey = Int(clamp(contrast, -100, 100).rounded())
-        guard exposureKey != 0 || highlightsKey != 0 || contrastKey != 0 else { return image }
-        let key = TableKey.bitmap(exposure: exposureKey, highlights: highlightsKey, contrast: contrastKey)
-        let table = table(for: key) {
-            bitmapCurve(exposure: Double(exposureKey) / 100, highlights: Double(highlightsKey), contrast: Double(contrastKey))
+        guard exposureKey != 0 || contrastKey != 0 || local != nil else { return image }
+        let table = table(for: .bitmap(exposure: exposureKey, contrast: contrastKey)) {
+            bitmapCurve(exposure: Double(exposureKey) / 100, contrast: Double(contrastKey))
         }
-        return apply(table, to: image)
+        return apply(table, to: image, exposure: Double(exposureKey) / 100, local: local)
     }
 
-    private static func bitmapCurve(exposure: Double, highlights: Double, contrast: Double) -> (Double) -> Double {
+    private static func bitmapCurve(exposure: Double, contrast: Double) -> (Double) -> Double {
         let gain = pow(2, max(exposure, 0))
         let darken = NegativeExposure(exposure)
+        let knee = 0.75
+        // Positive exposure rolls values pushed above white off with a rational shoulder that
+        // continues the slope at the knee and reaches white where white itself lands.
+        let startSlope = (gain - knee) / (1 - knee)
+        let c = startSlope > 1.0001 ? 1 / (startSlope - 1) : nil
         return { x in
-            var y: Double
+            let y: Double
             if exposure < 0 {
                 y = darken(min(x, 1))
+            } else if let c, x * gain > knee {
+                let u = min((x * gain - knee) / (gain - knee), 1)
+                y = knee + (1 - knee) * (1 + c) * u / (u + c)
             } else {
-                // Values pushed above white roll off instead of clipping.
-                let v = x * gain
-                let knee = 0.75
-                y = v <= knee ? v : knee + (1 - knee) * (1 - exp(-(v - knee) / (1 - knee)))
-            }
-            if highlights > 0 {
-                // Lift the upper tones in gamma space; the bump is 0 at both ends and monotonic.
-                let s = encode(y)
-                y = decode(s + 0.08 * highlights / 100 * 6.75 * s * s * (1 - s))
+                y = min(x * gain, 1)
             }
             return applyContrast(y, contrast, pivot: 0.5)
         }
@@ -212,29 +244,6 @@ nonisolated enum ToneMapping {
             guard x < 1 else { return x }
             return (a * x + b) * x + c
         }
-    }
-
-    /// Slider value (-100...100) to Highlights strength. Limits keep the curve monotonic:
-    /// the log-space slope is `1 - amount * bump'`, and `bump'` ranges from -6.75 to 2.25.
-    private static func highlightAmount(_ highlights: Double) -> Double {
-        let h = highlights / 100
-        return h < 0 ? -h * 0.4 : -h * 0.13
-    }
-
-    /// Scene value where Highlights starts; midtones below it are never touched.
-    private static let highlightPivot = 0.3
-
-    /// Reshapes tones between the pivot and `top` (display white), in stops. Positive `amount`
-    /// darkens the upper highlights and spreads out the tones just below white, which the
-    /// shoulder would otherwise squeeze together; negative brightens them. The pivot and `top`
-    /// map to themselves, and the change fades in with zero slope at the pivot.
-    private static func shiftHighlights(_ x: Double, amount: Double, top: Double) -> Double {
-        let range = log2(top / highlightPivot)
-        guard amount != 0, x > highlightPivot, x < top, range > 0 else { return x }
-        let stops = log2(x / highlightPivot)
-        let t = stops / range
-        let bump = 6.75 * t * t * (1 - t)  // 0 at both ends, 1 at t = 2/3, flat at the pivot
-        return highlightPivot * pow(2, stops - amount * range * bump)
     }
 
     /// S-curve in gamma space around `pivot` (an sRGB-encoded value that stays put). The slope

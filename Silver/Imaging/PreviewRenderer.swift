@@ -69,7 +69,7 @@ actor PreviewRenderer {
         if geometry {
             source.ensureLongEdge(source.longEdgeNeeded(for: settings.crop, outputPixelSize: maxPixelSize))
         }
-        guard let (image, baseSize) = ImagePipeline.render(source, settings: settings, geometry: geometry),
+        guard let (image, baseSize) = ImagePipeline.render(source, settings: settings, geometry: geometry, context: context),
               let cgImage = ImagePipeline.bitmap(image, from: image.extent, context: context, colorSpace: colorSpace)
         else { return nil }
         return (PreviewResult(image: cgImage, baseSize: baseSize), image)
@@ -92,7 +92,7 @@ actor PreviewRenderer {
     func renderDetail(url: URL, settings: EditSettings, geometry: Bool, rects: [CGRect], colorSpace: CGColorSpace) -> DetailResult? {
         guard let source = source(for: url, maxPixelSize: .infinity) else { return nil }
         source.ensureLongEdge(.infinity)
-        guard let (image, _) = ImagePipeline.render(source, settings: settings, geometry: geometry) else { return nil }
+        guard let (image, _) = ImagePipeline.render(source, settings: settings, geometry: geometry, context: context) else { return nil }
         let extent = image.extent
         let fullSize = extent.size
         let pieces = rects.compactMap { rect -> (CGImage, CGRect)? in

@@ -16,7 +16,12 @@
    - `CIColorKernel(source:)`（旧的 CIKL 字符串内核，已弃用）在本机仍然可以编译，不装 Metal toolchain 也能写逐像素内核。CLAUDE.md 中“无法写自定义内核”的说法需要修正。
    - Core Image 内置 `CIGuidedFilter`，可以作为局部 Highlights / Shadows 的边缘感知蒙版。
 
-建议的改进顺序见 §6。
+6. **Highlights / Shadows 的深入调研（2026-10-02，附录 B）**：
+   - 现在的实现效果差，原因可以量化。RAW 的 Highlights 是一条全局曲线，而且作用区间放错了地方：曝光 0、Highlights −100 时，场景值 0.45–1.0（普通高光）被挤进 219–227 这 8 级，细节反差只剩约 40%，省出来的层次给了 1.5 以上的过曝区。Shadows 用的是显示参考、全局的 `CIHighlightShadowAdjust`，+100 时把 18% 灰从 167 抬到 190，中间调也被压平。
+   - 建议改成局部方案：在场景线性数据上，按引导滤波得到的“基底亮度”逐像素改变曝光（RGB × 2^Δ），再走原有曲线。原型显示，天空、水面等大片高光能真正压回来，高光细节保留 93–97%（现在约 82%），在预览尺寸下每次渲染只多 0.4–1.6 ms。
+   - 引导滤波可以在 512 px 上算，系数与曝光无关，可以按照片缓存。多尺度的 Local Laplacian 在本次测试中没有明显优势。
+
+建议的改进顺序见 §6。附录 B 的方案取代附录 A 中与之不同的部分。
 
 ---
 
@@ -250,6 +255,8 @@ DNG SDK 只是参考渲染。Lightroom 从 PV2012（Lightroom 4，2012）开始�
 - Adobe 帮助页（helpx）和旧论坛（forums.adobe.com）本次无法访问。Eric Chan 关于“类胶片曝光”的原话没有找到一手来源。
 - Apple 的“曲线作用方式”是用 7 张 M11 实测推断的，不是 Apple 的文档说明。`RGBTone` 和逐通道在这批样本上无法区分。
 - darktable 和 RawTherapee 的描述基于官方手册和源码，没有在本机做对比渲染。
+- 测试 DNG 里的嵌入预览不是按其中的 Lightroom 设置渲染的（见 B.6）。后来找到了带设置的 Lightroom 导出（B.8），但没有 H/S 为 0 的对照版本，所以强度只能粗略对齐。
+- 附录 B 的“细节保留”和“平坦区偏差”是自定义指标，只在 3 张照片上测过，用来比较方案之间的相对好坏，不代表主观观感。
 
 ---
 
@@ -279,6 +286,242 @@ DNG SDK 只是参考渲染。Lightroom 从 PV2012（Lightroom 4，2012）开始�
 
 下一步：先做命令行原型，对比全局版和局部版的效果、光晕和耗时，再决定是否接入 App。第 6 条（Whites / Blacks）需要新增滑块和 sidecar 字段。
 
+> 2026-10-02 更新：原型已做，见附录 B。思路保持不变，有三处细节被附录 B 取代：
+> - 放大不用 `CIEdgePreserveUpsampleFilter`，改为把引导滤波的系数 (a, b) 放大，再用全分辨率的 L 求基底。
+> - ε 取约 1（1 档²），不是 0.5²。
+> - 降采样先在线性 RGB 上做，再取对数。
+
+---
+
+## 附录 B：Highlights / Shadows 深入调研（2026-10-02，commit `3ca876e`）
+
+测试数据：`~/Pictures/imports/test` 中的 43 张 Leica DNG。原型和测量脚本都是一次性的，没有放进仓库。做法如下：
+- 用 `CIRAWFilter`（与 `SourceImage` 相同设置）导出长边 2400 px 的场景线性数据。
+- 用 Python 实现各种局部算子。
+- 再交回 Swift，套用 App 自己的 `ToneMapping.raw` 曲线输出 PNG。
+
+这样各方案之间只有局部算子不同。
+
+### B.1 现在的实现为什么效果差（实测）
+
+现在的做法：RAW 的 Highlights 是 `ToneMapping.shiftHighlights`，在 log 空间、从枢轴 0.3 到 `sceneWhite × 2^曝光` 的区间里做鼓包形重分配，并入色调曲线。Shadows（以及 JPEG 的负 Highlights）是色调曲线**之后**的 `CIHighlightShadowAdjust`，radius 0。
+
+把场景线性灰阶送进现在的管线，得到的 8 位输出：
+
+| 场景值 | 0.005 | 0.02 | 0.09 | 0.18 | 0.3 | 0.45 | 0.6 | 0.8 | 1.0 | 1.5 | 2 | 3 | 6 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 曝光 0，H 0 | 13 | 40 | 115 | 167 | 202 | 226 | 238 | 244 | 247 | 251 | 252 | 254 | 255 |
+| 曝光 0，H −100 | 13 | 40 | 115 | 167 | 202 | **219** | **224** | **226** | **227** | 232 | 238 | 247 | 255 |
+| 曝光 +2，H 0 | 40 | 106 | 213 | 242 | 248 | 251 | 252 | 253 | 253 | 254 | 254 | 255 | 255 |
+| 曝光 +2，H −100 | 40 | 106 | 212 | **231** | **234** | **235** | **237** | **240** | **242** | 247 | 250 | 253 | 255 |
+| 曝光 0，S +100 | 29 | 69 | 157 | **190** | 212 | 231 | 241 | 247 | 250 | 254 | 255 | 255 | 255 |
+| 曝光 0，S −100 | 2 | 13 | 109 | 166 | 203 | 228 | 240 | 247 | 250 | 254 | 255 | 255 | 255 |
+
+曝光 0、H −100 时，曲线在各处的斜率与 H 0 之比（即细节反差保留了多少）：
+
+| 场景值 | ≤ 0.3 | 0.45 | 0.6 | 0.8 | 1.0 | 1.5 | 2 | 3 | 4 | 6 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 斜率比 | 1.00 | **0.40** | **0.38** | **0.37** | 0.74 | 2.86 | 5.21 | 6.94 | 6.28 | 3.77 |
+
+结论：
+1. **作用区间放错了地方。** 鼓包的峰在区间的 2/3 处。曝光 0 时，区间是 0.3–6，峰在场景值约 2.2，也就是大多已经过曝的余量区。普通高光（0.45–1.0）只是被整体压低、压扁：21 级层次被挤进 8 级，细节反差只剩 37–40%；斜率被转移到了 1.5 以上（×3–7）。真实照片里，天空、白衣服大多就在 0.45–1.0，所以 H −100 看起来只是“变灰”，几乎拉不回层次。曝光 +2 时更明显：场景 0.18–1.0 被挤进 231–242。
+2. **全局曲线的本质限制。** 曲线必须单调，要压低某一段亮度，就只能压平这一段，高光里的局部反差一定一起被压掉。这是 Lightroom 改用局部算法的原因（§2.4）。
+3. **Shadows 作用在显示参考数据上，而且也是全局的。** +100 把 18% 灰从 167 抬到 190（约 +0.5 EV），0.18–0.3 这一段从 35 级压到 22 级，所以中间调整体发灰。−100 则把 0.005–0.02 压到 2–13，近乎死黑。
+4. RAW 和 JPEG 的 Highlights 用两套不同算法，正负方向也不对称。
+
+**你的实际用法**（43 张测试照片里 Lightroom 写入的 `crs:` 设置）：
+- Highlights 为 −100 的有 20 张，为负的共 31 张，为正的 5 张。
+- Shadows 为正的 31 张（多在 +15 到 +75），为负的 9 张。
+- 曝光 ≥ +1 的 24 张，平均 +1.13。
+
+典型组合是“曝光 +1 到 +2，Highlights −100，Shadows +25 左右”，正好落在上面最差的情况里：提了曝光以后，再用 Highlights 把天空压回来。新的 Highlights 必须在这个组合下有效。
+
+### B.2 各家做法补充
+
+**Lightroom / Camera Raw（PV2012 及以后）**：
+- 补充 §2.4：据 Adobe 帮助页的检索摘要（原页仍是 403），这些控件是场景自适应的。高反差图像上，它们的有效范围会自动扩大，低反差图像上会自动缩小，“如同每个像素都有自己的色调曲线”。
+- 正负方向强度对称（+10 与 −10 力度相当）。
+- 技术来源仍是 Local Laplacian Filters。
+
+**Capture One（High Dynamic Range 工具）**：
+- 四个滑块。Highlight 覆盖较宽的亮部，延伸到中间调；White 只管最亮的一端。Shadow 和 Black 对称。
+- 负值变暗、正值变亮（官方支持文档）。
+- 与 Lightroom 一样，是“宽范围的 Highlights / Shadows + 窄范围的 Whites / Blacks”这两层结构。
+
+**Apple Photos**（本机 Core Image 枚举，`CICategoryApplePrivate`，私有）：
+- `CISmartToneFilter` 的输入有 `inputExposure`、`inputContrast`、`inputBrightness`、`inputShadows`、`inputHighlights`、`inputBlack`、`inputRawHighlights`、`inputLocalLight`、`inputLightMap`（NSData）。
+- `CILocalLightFilter` 的输入有 `inputGuideImage`、`inputLightMap`、`inputLightMapWidth` / `Height`、`inputLocalLight`、`inputSmartShadows`。
+- 另有 `CILocalContrast`（`inputStrength`、`inputScale`）。
+- 由此推断，Photos 的“光效”是先算一张低分辨率的“光照图”，再借助引导图在全分辨率上应用。这与本附录推荐的结构相同。
+- 这些都是私有滤镜，不能用。
+- 公开的 `CIHighlightShadowAdjust` 在 radius > 0 时是局部的，但它作用在显示参考数据上。实测它会明显放大细节反差（高光 ×1.1–1.3，暗部 ×1.4–1.7，近似锐化或 Clarity），而且在一张图上把暗部压暗了 1.2 档，与参数方向相反。行为不可控，不适合作为 Silver 的 Highlights / Shadows。
+
+**darktable tone equalizer**（源码 `src/iop/toneequal.c`、`src/common/eigf.h`、`fast_guided_filter.h`）：
+- 全程在线性 RGB 上：亮度蒙版取 log2（EV），在 −8 到 0 EV 共 9 个控制点之间用高斯径向基函数插值出每档的曝光修正，再以 `RGB × 2^修正` 作用。
+- 蒙版用自引导滤波做“表面模糊”。默认是 EIGF（exposure-independent guided filter），解决普通引导滤波“暗部比亮部模糊得多”的问题。
+- 直径默认是长边的 5%（建议 1–10%）。feathering（相当于 1/ε）默认 1。“压缩阴影 / 高光”的 EIGF 预设分强、中、弱三档：feathering 分别为 20、7、1，迭代 5、3、1 次；普通引导滤波版本的 feathering 用 500。
+- 引导滤波是线性的，所以先缩小到 1/4（双线性）计算均值和方差，再放大回来套用，速度快 10 倍以上。
+- 官方文档提醒：feathering 低，过渡平滑，但可能出现光晕。
+
+**darktable local contrast（local laplacian 模式，`src/common/locallaplacian.c`）**：
+- 在 Lab 的 L 上做 Fast Local Laplacian，只采样 6 个亮度级（`num_gamma = 6`）。
+- 重映射曲线在 ±2σ 以内用二次贝塞尔混合，以外的斜率分别由 shadows / highlights 参数决定，中间叠加 clarity 项。
+- 手册承认，参数极端时会因为这个快速近似而出现色带。
+
+**Google HDR+**（Hasinoff 等 2016，§6 “Dynamic range compression”）：
+- 从合并后的 HDR 图像用增益和 gamma 生成长、短两张“合成曝光”，只在灰度上做 exposure fusion（Mertens 2007，拉普拉斯金字塔混合），权重是一个固定的亮度函数（一张 1D 表）。
+- 融合后撤销 gamma，再按原线性 RGB 的逐像素色度比例上色。
+- 也就是说，手机上的方案同样是“只在亮度上算局部增益，颜色比例不变”。
+
+**“低分辨率求解、全分辨率套用”的理论依据**：
+- Fast Guided Filter（He & Sun 2015）证明，引导滤波的系数 (a, b) 可以在降采样后计算，放大后再与全分辨率引导图组合，几乎不损失质量。
+- Bilateral Guided Upsampling（Chen 等 2016，Google）把任意影调算子在低分辨率上拟合成局部仿射变换，再在全分辨率上求值，用于手机影调映射。
+
+### B.3 原型：同一条 Δ 曲线，四种基底
+
+所有方案都只在场景线性数据上逐像素乘以 2^Δ（三通道同一系数，色相不变），再走原有的 `rgbTone` 曲线。区别只在基底亮度 B 怎么求。
+
+Δ（单位为档）以曝光后的中灰为参照，r = B − log2(0.18)：
+- Highlights：`Δ_h = −0.5 · h · soft(r)`，即把中灰以上的基底向中灰压缩 50%（h = 1 对应滑块 −100）。`soft` 是宽 1 档的二次软膝。
+- Shadows：`Δ_s = +0.35 · s · min(soft(−1 − r), 5)`，即把中灰以下 1 档以外的基底往上提，最多 5 档 × 0.35。
+- 这两组系数是为了比较方案临时定的，不是最终强度。
+
+基底的四种求法：
+- **global**：B = 像素自身的 L（相当于在场景线性上的全局曲线）。
+- **gauss**：L 的高斯模糊，σ = 长边 2%。
+- **guided**：自引导滤波。先缩到长边 512，以盒式均值求 (a, b)，再双线性放大，B = a·L + b（L 为全分辨率）。参数为半径（长边百分比）和 ε（档²）。
+- **llf**：Fast Local Laplacian（Aubry 等 2014），在 log2 亮度上以 1 档间隔采样。重映射 `r_g(i) = i + Δ(m)`，`m = g + sign(i−g)·max(|i−g| − σr, 0)`：σr 以内的细节跟随 g 的曝光变化，更大的跳变用自己的。
+
+两个指标：
+- **细节保留**：输出与 H/S = 0 的输出相比，σ = 2 px 高通的标准差之比。只统计有纹理的像素：“高光”是基础渲染 ≥ 200 级的像素，“暗部”是 8–70 级的。
+- **平坦区偏差**：在局部标准差 < 0.02 档的平坦区域（高光或暗部），输出与 global 方案的差的 p99，单位为档。平坦区本应与 global 一致，偏差就是光晕或亮度漂移。
+
+测试照片：L1009244（逆光骑车，大片亮天和水面，曝光 +1.46），L1009150（海边人物剪影，+0.90），L1080953（室内展厅，亮灯和白墙，+2.05）。设置 h = 1（Highlights −100），s = 0.5（Shadows +50）。
+
+| 方案 | 高光细节保留（3 张） | 平坦区偏差 p99（档） |
+|---|---|---|
+| 现在的 Silver（H −100 / S +50） | 0.82 / 0.81 / 0.82 | — |
+| global | 0.87 / 0.88 / 0.85 | 0 |
+| gauss σ 2% | 1.00 / 1.02 / 1.10 | 0.18 / 0.18 / 0.26（光晕） |
+| guided r 2%，ε 0.25 | 0.90 / 0.91 / 0.89 | 0.06 / 0.07 / 0.07 |
+| **guided r 2%，ε 1** | **0.93 / 0.94 / 0.95** | **0.08 / 0.10 / 0.12** |
+| guided r 4%，ε 1 | 0.93 / 0.94 / 0.94 | 0.10 / 0.17 / 0.14 |
+| guided r 2%，ε 4 | 0.97 / 0.98 / 1.01 | 0.12 / 0.13 / 0.19 |
+| guided r 8%，ε 2 | 0.95 / 0.95 / 0.97 | 0.12 / 0.28 / 0.22 |
+| llf σr 0.5 | 0.91 / 0.90 / 0.89 | 0.13 / 0.13 / 0.14 |
+| llf σr 1 | 0.95 / 0.93 / 0.95 | 0.14 / 0.22 / 0.18 |
+| llf σr 1.5 | 0.97 / 0.96 / 1.00 | 0.15 / 0.26 / 0.20 |
+
+（照片顺序：L1009244 / L1009150 / L1080953。）
+
+观察：
+- **在场景线性上调曝光，本身就比现在好。** 即使是 global，细节保留也从 0.82 升到 0.87，而且确实把高光压了下来。L1009244 中，现在的 H −100 让天空和水面几乎保持白色、只是变平；新方案下云层和海面的层次都回来了。
+- **细节和光晕是同一个旋钮的两端。** ε 越大、半径越大，细节保留越多，平坦区偏差也越大。高斯基底细节最全，但光晕最重。
+- **同等细节保留下，guided 不比 llf 差，偏差还更小。** 比如细节约 0.97 时，guided 的 p99 是 0.12–0.19 档，llf 是 0.15–0.26 档。这里的 llf 是一个粗略实现，但至少在本组测试中，多尺度没有显示出值得多花成本的优势。
+- **计算基底的分辨率不敏感。** guided r 4%、ε 1 在 256、512、1024 px 上算，L1009244 的细节保留是 0.93 / 0.93 / 0.92，偏差 p99 是 0.100 / 0.098 / 0.098。512 px 足够。
+- **局部的语义**：被大片亮区包围的小块暗部，基底是亮的，所以 Shadows 几乎不提它（L1009244 中，暗部平均提亮：global +0.71 档，guided +0.6 档，gauss +0.12 档）。这正是“按区域而不是按像素调整”的含义，也是 Lightroom 的行为方向，但会让 Shadows 在细碎暗部上的力度显得弱一些，调强度时要注意。
+- **过曝区不会变灰。** 基础渲染中 ≥ 252 级的像素，H −100 后：现在的 Silver 是 240–246，global 是 245–246，guided 是 248–249，llf 是 249–250。因为 `sceneWhite` = 6 远在过曝区之上，压缩 50% 后，过曝区仍落在肩部。
+
+### B.4 Core Image 实现与性能（实测）
+
+原型用 Metal CI 内核（`-fcikernel`）：
+1. `logLuma`：在 512 px 的降采样图上求 (L, L²)。
+2. `CIBoxBlur` 求均值。
+3. `guidedCoefficients`：求 (a, b)，再做一次 `CIBoxBlur`。
+4. 把局部曝光**并入现有的 `rgbTone`**：同一个内核里，用全分辨率 L 和双线性放大的 (a, b) 求 B，查一张 1D 的 Δ(B) 表，乘以 2^Δ，再做原来的 RGBTone。
+
+全分辨率上不增加任何 pass。每次渲染的耗时（中位数，交替顺序，每次改一个标量参数，避免 Core Image 直接复用缓存的输出）：
+
+| 尺寸 | 上下文 | 现在的 `rgbTone` | 局部，系数已缓存 | 局部，含求系数 | 只求系数 |
+|---|---|---|---|---|---|
+| 2560 长边（4.4 MP） | 缓存中间结果（同预览） | 2.8 ms | 3.2 ms | 3.8 ms | 1.7 ms |
+| 5120 长边（17 MP） | 同上 | 6.8 ms | 8.4 ms | 10.6 ms | 1.9 ms |
+| 8368 × 5584（47 MP） | 不缓存（同导出） | 272 ms | 287 ms | 323 ms | — |
+
+- 预览每次拖动滑块只多 0.4–1.6 ms。
+- 导出多 5%（系数已缓存）到 19%（现算）。
+- 系数与 Highlights / Shadows 滑块无关。
+- **系数与曝光也无关**：在 log 域里，曝光只是给 L 加一个常数，引导滤波的 a 不变，b 恰好平移同一个常数，所以 B 也只平移这个常数。
+- 系数只随白平衡、色调（tint）变化，可以按照片缓存。
+- 注意：在缓存中间结果的上下文里，60 MP 全图渲染从 196 ms 涨到 299 ms。这与 CLAUDE.md 记录的约 16 MP 的 RAW 缓存上限一致，不影响 100% 视图那种 ≤ 14 MP 的分块渲染。
+
+### B.5 预览、缩略图与导出的一致性（实测）
+
+基底必须在预览、缩略图、导出之间一致，否则它们的局部效果会不同。分别从 1200、2560 和全分辨率的解码求系数（都降到 512 px），比较每个像素在其实际亮度 ±0.5 档处的 B：
+- **先取 log 再降采样**明显更差。全分辨率噪声更大，log 的平均值会被拉低（Jensen 不等式）。
+- **先在线性 RGB 上降采样（高质量降采样），再取 log**：
+  - 平均差 0.003–0.013 档
+  - p99 为 0.03–0.135 档
+  - p99.9 为 0.10–0.42 档
+  - 个别高光点最大约 2 档
+- Δ 是 B 的 0.5 倍（H −100 时），所以 p99 的输出差约 0.05 档，即高光里 1–2 级。
+
+建议：
+- 每张照片（每组白平衡）只算一次系数，缓存成一张约 340 × 512 的小图，预览、缩略图、100% 分块和导出都用它，结果就完全一致。
+- **系数绝不能在 100% 分块渲染里现算**：那会让每个分块都要求整张全分辨率图（ROI 是全图），破坏分块的意义。
+- 导出时如果没有缓存，从导出的解码现算即可，差异如上。
+
+### B.6 关于 Lightroom 参考
+
+测试 DNG 由 Lightroom 9.5.1 写入了 `crs:` 设置，也带有 1620 或 2112 px 的嵌入预览。但这些预览**不是**按其中设置渲染的：
+- 12 张样本的中位亮度与 Silver 在曝光 0 下的渲染相差 −0.8 到 +0.8 档。
+- 与 Silver 在 Lightroom 曝光值下的渲染相差 −0.6 到 −5.4 档（L1009190 的设置是 +4 EV，预览却和曝光 0 一样亮）。
+
+所以无法用它们反推 Lightroom Highlights / Shadows 的强度和空间尺度。要对齐强度，需要从 Lightroom 导出同一张照片在 H/S 为 0、Highlights −100、Shadows +100 时的 JPEG，再用本附录的配准和回归脚本比较。配准用 SIFT 加单应矩阵，回归是把亮度差对像素亮度和不同尺度的模糊亮度做二维分箱。
+
+### B.7 建议方案（取代附录 A 中不同的部分）
+
+1. **位置和作用方式**：RAW 和 JPEG 统一。在场景线性数据（白平衡之后、全局曲线之前；JPEG 为线性化后的数据）上，逐像素 `RGB × 2^Δ`，三通道同一系数，色相不变。并入 `rgbTone` 内核，不增加全分辨率 pass。删除 `shiftHighlights` 和 RAW 用的 `CIHighlightShadowAdjust`。
+2. **基底**：
+   - 自引导滤波，作用在 log2 亮度上。
+   - 先把线性 RGB 高质量降采样到长边 512，再取 log。
+   - 盒式窗口半径约为长边的 2%（512 px 上约 10 px），ε 约为 1 档²。
+   - 系数 (a, b) 双线性放大，用全分辨率的 L 求 `B = a·L + b`。
+   - 这两个参数决定细节与光晕的取舍，接入 App 后在真实界面里微调。
+3. **缓存**：系数只依赖白平衡和照片本身，与曝光、Highlights / Shadows 无关。按“照片 + 白平衡”缓存，所有输出共用（B.5）。
+4. **Δ(B) 曲线**：
+   - 以曝光后的中灰为参照，所以会随曝光一起移动。由于压缩量与基底离中灰的距离成正比，反差大的图像被压得更多，这与 Lightroom“按图像范围自适应”的方向一致。
+   - Highlights 负值把中灰以上的基底向中灰压缩，正值反向拉开。
+   - Shadows 正值提亮中灰以下的基底，负值压暗，并对极暗处设上限，避免提起纯噪声。
+   - 两者都做成一张 1D 表，随滑块重建，代价与现在的色调表相同。
+   - 起点强度用 B.3 的系数（−100 时压缩 50%，+100 时最多提 1.75 档），再按实际观感和 Lightroom 参考（B.6）调整。
+5. **多尺度**：先不做。本次测试中，Local Laplacian 在同等细节保留下没有更少的光晕，成本却是 K 套金字塔。如果单尺度在强设置下出现明显光晕，再考虑以 Fast LLF 或 exposure fusion 作为第二阶段。
+6. **风险**：
+   - 提亮暗部会放大噪点（与 Lightroom 相同）。
+   - 强设置下，大片亮区边缘可能有轻微光晕。
+   - 被亮区包围的小块暗部，Shadows 力度显得弱。
+   - 系数缓存要随白平衡失效。
+7. **Whites / Blacks**（§6 第 6 条）不受影响，仍可以作为全局曲线两端的调整，以后单独加。
+
+### B.8 实施状态（2026-10-02）
+
+已按 B.7 实现：
+- `LocalTone.swift` 计算引导滤波系数。
+- `ToneKernels.metal` 新增 `rgbToneLocal` 和三个求系数的内核。
+- Δ 直接在 `rgbToneLocal` 内核里按公式计算（只是几次乘法），不再做成 B.7 设想的 1D 表；曝光作为内核参数传入，所以拖曝光时不必重建任何表。删除了旧的 `shiftHighlights`，`ImagePipeline` 不再调用 `CIHighlightShadowAdjust`。
+- `SourceImage` 按白平衡缓存系数，系数总是从 1024 px 的解码求得。
+
+与 B.7 的差异和实施细节：
+- **Shadows 从中灰开始**，而不是中灰以下 1 档。原型的范围只影响到显示 90 级以下，比 Lightroom、Capture One 窄。现在 +100 把中灰以下的距离减半，最多提 2 档；Highlights 不变（−100 把中灰以上的距离减半）。两者都在离开中灰的第一档内用二次曲线渐入。
+- **方差的算法。** 方差用 `box((L − box(L))²)`，不用 `E[L²] − E[L]²`：默认上下文的中间结果是半精度浮点，后者会丢掉大部分精度。
+- **JPEG 也走同一套局部算子。** 同时修正了一个旧问题：JPEG 的曝光肩部在曝光为 0 时也会生效，导致只调 Contrast 时，白色最高只到 0.908（约 247 级）。现在肩部只在提曝光时启用，并且在白点处精确到达白。
+
+验证（实测）：
+- **Highlights / Shadows 为 0 时完全不变。** RAW 在三组曝光和对比度下逐像素一致，JPEG 不调整时原样输出。
+- **预览与导出一致。** 2560 px 的预览，与全分辨率渲染后缩到同一尺寸相比：低频（模糊 4 px 后）差异平均 0.50 → 0.65 级，p99 都是 5–8 级，与 H/S 为 0 时的差异基本相同。
+- **耗时**（预览上下文，2560 px，每步改一次滑块，中位数，旧 → 新）：
+  - Highlights 4.0 → 3.8 ms，Shadows 4.5 → 3.9 ms，曝光 3.5 → 3.5 ms。
+  - 开着 Highlights 拖色温 6.0 → 9.4 ms，因为每步都要重算系数。
+  - 全分辨率导出（含解码）：开着 H/S 时 1.26 → 1.40 s，不开时不变。
+- **在 App 里实际查看**：L1009150（H −100、S +100）的网格缩略图、loupe 和 100% 分块都正常，人物与海面的交界处没有光晕，也没有分块接缝。
+
+**与 Lightroom 导出的对比**：`~/Pictures/Lightroom Saved Photos` 里有 26 张 nafa 系列的 Lightroom 全尺寸导出，带有 DNG 里记录的设置。配准后，按 Silver（H/S 为 0）的显示亮度分段，比较亮度差（档）：
+- **Highlights 大体一致。** 230–252 级段，Lightroom 是 −0.12 到 −0.17，Silver 是 −0.14 到 −0.25。
+- **Shadows 在部分照片上明显比 Lightroom 弱。**
+  - 曝光 +1.2 到 +2 的三张照片（S +26、+27、+62），最暗段（5–40 级）Lightroom 比 Silver 多提了 1.2–2.5 档。
+  - L1080923（S +52）和 L1080933（S +34）则只差 0.04–0.1 档。
+- 这些导出没有 H/S 为 0 的版本，所以分不清差距来自 Lightroom 的 Shadows，还是来自它的曝光实现和 profile。要准确校准，需要同一张照片在 H/S 为 0 时的 Lightroom 导出。
+
 ---
 
 ## 参考资料
@@ -294,3 +537,10 @@ DNG SDK 只是参考渲染。Lightroom 从 PV2012（Lightroom 4，2012）开始�
 - darktable 手册：[sigmoid](https://docs.darktable.org/usermanual/development/en/module-reference/processing-modules/sigmoid/)、[filmic rgb](https://docs.darktable.org/usermanual/development/en/module-reference/processing-modules/filmic-rgb/)、[tone equalizer](https://docs.darktable.org/usermanual/development/en/module-reference/processing-modules/tone-equalizer/)
 - RawTherapee 源码：[rtengine/curves.h](https://github.com/RawTherapee/RawTherapee/blob/dev/rtengine/curves.h)（`AdobeToneCurve`）、[rtengine/improcfun.cc](https://github.com/RawTherapee/RawTherapee/blob/dev/rtengine/improcfun.cc)
 - Apple，`CIRAWFilter.h`（macOS 27 SDK 头文件注释）、[CIRAWFilter 文档](https://developer.apple.com/documentation/coreimage/cirawfilter)
+- darktable 源码：[src/iop/toneequal.c](https://github.com/darktable-org/darktable/blob/master/src/iop/toneequal.c)、[src/common/eigf.h](https://github.com/darktable-org/darktable/blob/master/src/common/eigf.h)、[src/common/fast_guided_filter.h](https://github.com/darktable-org/darktable/blob/master/src/common/fast_guided_filter.h)、[src/common/locallaplacian.c](https://github.com/darktable-org/darktable/blob/master/src/common/locallaplacian.c)；手册：[local contrast](https://docs.darktable.org/usermanual/development/en/module-reference/processing-modules/local-contrast/)
+- S. W. Hasinoff 等，[Burst photography for high dynamic range and low-light imaging on mobile cameras](https://www.hdrplusdata.org/hdrplus.pdf)，SIGGRAPH Asia 2016（§6 Dynamic range compression）
+- T. Mertens, J. Kautz, F. Van Reeth，[Exposure Fusion](https://diglib.eg.org/items/f3cd0d59-7153-4c49-ae29-60e1819a9989)，Computer Graphics Forum 2009
+- K. He, J. Sun，[Fast Guided Filter](https://arxiv.org/abs/1505.00996)，2015
+- J. Chen, A. Adams, N. Wadhwa, S. W. Hasinoff，[Bilateral Guided Upsampling](https://research.google/pubs/bilateral-guided-upsampling/)，SIGGRAPH Asia 2016
+- Capture One 支持文档：[High Dynamic Range 工具](https://support.captureone.com/hc/en-us/articles/360002602737)
+- Adobe，[Tone Control Adjustment in Lightroom Classic and Adobe Camera Raw](https://helpx.adobe.com/lightroom-classic/help/tone-control-adjustment.html)（2026-10-02 仍为 403，内容据检索摘要：PV2012 控件按图像自适应调整有效范围）

@@ -18,8 +18,8 @@ nonisolated final class SourceImage {
     private let nativeSize: CGSize
     /// Long edge the image is currently decoded at.
     private(set) var decodedLongEdge: CGFloat
-
-    var isRaw: Bool { rawFilter != nil }
+    /// Local tone coefficients (see `LocalTone`) and the white balance they were computed with.
+    private var localCoefficients: (temperature: Double, tint: Double, image: CIImage)?
 
     /// Loads `url`, downscaled so the long edge is at most `maxPixelSize` (nil = full resolution).
     init?(url: URL, maxPixelSize: CGFloat?) {
@@ -86,19 +86,26 @@ nonisolated final class SourceImage {
         let nativeLongEdge = max(nativeSize.width, nativeSize.height)
         if decodedLongEdge >= nativeLongEdge {
             bitmap = CIImage(contentsOf: url, options: [.applyOrientationProperty: true])
-        } else if let source = CGImageSourceCreateWithURL(url as CFURL, nil) {
-            let options: [CFString: Any] = [
-                kCGImageSourceCreateThumbnailFromImageAlways: true,
-                kCGImageSourceCreateThumbnailWithTransform: true,
-                kCGImageSourceThumbnailMaxPixelSize: decodedLongEdge,
-            ]
-            bitmap = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary).map { CIImage(cgImage: $0) }
+        } else {
+            bitmap = loadBitmap(longEdge: decodedLongEdge)
         }
         return bitmap
     }
 
-    /// The developed image with light and color adjustments applied (no geometry).
-    func developed(with settings: EditSettings) -> CIImage? {
+    private func loadBitmap(longEdge: CGFloat) -> CIImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: longEdge,
+        ]
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary).map { CIImage(cgImage: $0) }
+    }
+
+    /// The developed image with light and color adjustments applied (no geometry). `context`
+    /// renders the local tone coefficients when Highlights or Shadows need them.
+    func developed(with settings: EditSettings, context: CIContext) -> CIImage? {
+        let usesLocal = settings.highlights != 0 || settings.shadows != 0
         var image: CIImage
         if let raw = rawFilter {
             // Temperature is adjusted in mired space so the slider feels even across the range.
@@ -106,46 +113,58 @@ nonisolated final class SourceImage {
             let mired = max(asShotMired - settings.temperature * 0.8, 20)
             raw.neutralTemperature = Float(1_000_000 / mired)
             raw.neutralTint = asShotTint + Float(settings.tint)
+            // Before taking the output: computing coefficients changes the decode scale for a moment.
+            let local = usesLocal ? localAdjustment(settings, context: context) : nil
             guard let output = raw.outputImage else { return nil }
-            image = ToneMapping.raw(output, exposure: settings.exposure, highlights: settings.highlights, contrast: settings.contrast)
+            image = ToneMapping.raw(output, exposure: settings.exposure, contrast: settings.contrast, local: local)
         } else {
             guard let bitmap = loadBitmap() else { return nil }
-            image = bitmap
-            if settings.temperature != 0 || settings.tint != 0 {
-                let targetMired = 1_000_000 / 6500 + settings.temperature * 0.8
-                let filter = CIFilter.temperatureAndTint()
-                filter.inputImage = image
-                filter.neutral = CIVector(x: 6500, y: 0)
-                filter.targetNeutral = CIVector(x: 1_000_000 / max(targetMired, 20), y: -settings.tint)
-                image = filter.outputImage ?? image
-            }
-            image = ToneMapping.bitmap(image, exposure: settings.exposure, highlights: settings.highlights, contrast: settings.contrast)
+            let local = usesLocal ? localAdjustment(settings, context: context) : nil
+            image = ToneMapping.bitmap(
+                whiteBalanced(bitmap, settings), exposure: settings.exposure, contrast: settings.contrast, local: local
+            )
         }
-        // RAW Highlights and all Contrast are part of the tone curve; JPEGs have no highlight
-        // headroom, so darkening their highlights uses CIHighlightShadowAdjust.
-        let highlightsDown = isRaw ? 0 : min(settings.highlights, 0)
-        return ImagePipeline.applyTone(
-            highlights: highlightsDown, shadows: settings.shadows,
-            vibrance: settings.vibrance, saturation: settings.saturation, to: image
-        )
+        return ImagePipeline.applyColor(vibrance: settings.vibrance, saturation: settings.saturation, to: image)
+    }
+
+    private func whiteBalanced(_ bitmap: CIImage, _ settings: EditSettings) -> CIImage {
+        guard settings.temperature != 0 || settings.tint != 0 else { return bitmap }
+        let targetMired = 1_000_000 / 6500 + settings.temperature * 0.8
+        let filter = CIFilter.temperatureAndTint()
+        filter.inputImage = bitmap
+        filter.neutral = CIVector(x: 6500, y: 0)
+        filter.targetNeutral = CIVector(x: 1_000_000 / max(targetMired, 20), y: -settings.tint)
+        return filter.outputImage ?? bitmap
+    }
+
+    /// Highlights and Shadows with this photo's local tone coefficients, computed for the
+    /// current white balance on first use. They come from a decode of a fixed size, so every
+    /// output of the photo gets the same ones.
+    private func localAdjustment(_ settings: EditSettings, context: CIContext) -> LocalAdjustment? {
+        if localCoefficients?.temperature != settings.temperature || localCoefficients?.tint != settings.tint {
+            let image: CIImage?
+            if let rawFilter {
+                let scale = rawFilter.scaleFactor
+                rawFilter.scaleFactor = Float(min(LocalTone.decodeLongEdge / max(nativeSize.width, nativeSize.height), 1))
+                image = rawFilter.outputImage.flatMap { LocalTone.coefficients(of: $0, context: context) }
+                rawFilter.scaleFactor = scale
+            } else {
+                image = loadBitmap(longEdge: LocalTone.decodeLongEdge)
+                    .flatMap { LocalTone.coefficients(of: whiteBalanced($0, settings), context: context) }
+            }
+            guard let image else { return nil }
+            localCoefficients = (settings.temperature, settings.tint, image)
+        }
+        return localCoefficients.map { LocalAdjustment(coefficients: $0.image, highlights: settings.highlights, shadows: settings.shadows) }
     }
 }
 
 nonisolated enum ImagePipeline {
     static let sRGB = CGColorSpace(name: CGColorSpace.sRGB)!
 
-    /// Shadows, negative Highlights (JPEG only), vibrance and saturation.
-    static func applyTone(highlights: Double, shadows: Double, vibrance: Double, saturation: Double, to input: CIImage) -> CIImage {
+    /// Vibrance and saturation.
+    static func applyColor(vibrance: Double, saturation: Double, to input: CIImage) -> CIImage {
         var image = input
-
-        if highlights < 0 || shadows != 0 {
-            let filter = CIFilter.highlightShadowAdjust()
-            filter.inputImage = image
-            filter.radius = 0  // Scale independent, so previews match full-size exports.
-            filter.highlightAmount = Float(1 + min(highlights, 0) / 100 * 0.7)
-            filter.shadowAmount = Float(shadows / 100 * 0.6)
-            image = filter.outputImage ?? image
-        }
 
         if vibrance != 0 {
             let filter = CIFilter.vibrance()
@@ -197,9 +216,9 @@ nonisolated enum ImagePipeline {
             .transformed(by: CGAffineTransform(translationX: -rect.minX, y: -rect.minY))
     }
 
-    /// Full rendering recipe.
-    static func render(_ source: SourceImage, settings: EditSettings, geometry: Bool) -> (image: CIImage, baseSize: CGSize)? {
-        guard let developed = source.developed(with: settings) else { return nil }
+    /// Full rendering recipe. `context` is the one that will render the result.
+    static func render(_ source: SourceImage, settings: EditSettings, geometry: Bool, context: CIContext) -> (image: CIImage, baseSize: CGSize)? {
+        guard let developed = source.developed(with: settings, context: context) else { return nil }
         let baseSize = developed.extent.size
         let image = geometry ? applyGeometry(settings, to: developed) : developed
         return (image, baseSize)

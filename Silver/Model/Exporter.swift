@@ -65,7 +65,7 @@ nonisolated enum Exporter {
 
     static func export(_ job: ExportJob, to destination: URL, options: ExportOptions) throws {
         guard let source = SourceImage(url: job.source, maxPixelSize: nil) else { throw ExportError.cannotDecode }
-        guard let (image, _) = ImagePipeline.render(source, settings: job.settings, geometry: true),
+        guard let (image, _) = ImagePipeline.render(source, settings: job.settings, geometry: true, context: context),
               let cgImage = context.createCGImage(image, from: image.extent, format: .RGBA8, colorSpace: ImagePipeline.sRGB)
         else { throw ExportError.cannotRender }
 
