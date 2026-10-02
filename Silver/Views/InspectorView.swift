@@ -294,12 +294,12 @@ private struct PhotoInfoHeader: View {
                         .help("Reset This Photo's Adjustments")
                 }
                 if let metadata = photo.metadata {
+                    let equipment = [metadata.camera, metadata.lens].compactMap(\.self)
                     Group {
-                        if let camera = metadata.camera { Text(camera) }
-                        if let lens = metadata.lens { Text(lens) }
                         if let date = metadata.captureDate {
                             Text(date.formatted(date: .abbreviated, time: .shortened))
                         }
+                        if !equipment.isEmpty { Text(equipment.joined(separator: " · ")) }
                     }
                     .font(.caption)
                     .foregroundStyle(.secondary)
