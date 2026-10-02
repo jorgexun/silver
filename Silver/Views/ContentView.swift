@@ -121,6 +121,9 @@ struct ContentView: View {
                 .disabled(library.targetPhotos.isEmpty)
         }
 
+        // The inspector toggle gets its own group, apart from the photo actions.
+        ToolbarSpacer(.fixed, placement: .primaryAction)
+
         ToolbarItem(placement: .primaryAction) {
             Button("Adjustments", systemImage: "sidebar.trailing") {
                 library.isInspectorPresented.toggle()
