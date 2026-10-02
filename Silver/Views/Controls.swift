@@ -3,6 +3,9 @@ import SwiftUI
 extension Color {
     /// Neutral background behind photos.
     static let canvas = Color(white: 0.11)
+    /// Outline of selected thumbnails. Lighter than the accent color (a mid gray, so the white
+    /// text on sidebar highlights and buttons stays readable).
+    static let selectionRing = Color(white: 0.68)
 }
 
 /// How a `TrackSlider` draws its track.
@@ -231,7 +234,7 @@ extension View {
         overlay {
             if isSelected {
                 RoundedRectangle(cornerRadius: cornerRadius)
-                    .strokeBorder(Color.accentColor.opacity(isActive ? 1 : 0.55), lineWidth: isActive ? 2.5 : 1.5)
+                    .strokeBorder(Color.selectionRing.opacity(isActive ? 1 : 0.55), lineWidth: isActive ? 1.5 : 1)
             }
         }
     }

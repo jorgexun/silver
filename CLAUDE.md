@@ -105,7 +105,7 @@ JPEG sources use `CITemperatureAndTint` for white balance and the same kernels w
 - Export runs jobs sequentially in `Task.detached`. It writes sRGB JPEGs with a whitelisted subset of the original EXIF/GPS/TIFF metadata and orientation 1.
 
 **UI conventions.** Shared controls live in `Views/Controls.swift`.
-- The chrome stays neutral so it doesn't compete with the photo. The accent color marks selection and primary actions; values are drawn in white.
+- The chrome stays neutral so it doesn't compete with the photo. The accent color, a mid gray (`AccentColor` asset, set as the global accent in build settings), marks selection and primary actions; it stays dark enough for the white text the system draws on sidebar highlights and buttons. Thumbnail selection rings use the lighter `Color.selectionRing`. Values are drawn in white.
 - Adjustments use `TrackSlider`, not `Slider`. Its fill starts at the default value, so an untouched adjustment shows no fill and a changed one shows how far it moved. White balance tracks show their color scale instead of a fill.
 - Inspector sections match the Copy Adjustments groups (Crop, Light, White Balance, Color). Each adjustment, and the crop, shows a reset icon after its name only when it has changed; section headers have none. The photo's Reset is in the header next to its name. Copy and Paste are menu commands only (⌘C, ⌘V), with no inspector buttons.
 - Floating labels over the photo use `canvasLabel()` (glass capsule).
