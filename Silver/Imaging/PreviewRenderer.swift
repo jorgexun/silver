@@ -89,10 +89,10 @@ actor PreviewRenderer {
     /// Renders parts of the photo at full resolution, for viewing at 100%. `rects` are in
     /// full-resolution output pixels with a top-left origin and are clipped to the image; pass
     /// none to only get the full-resolution size.
-    func renderDetail(url: URL, settings: EditSettings, geometry: Bool, rects: [CGRect], colorSpace: CGColorSpace) -> DetailResult? {
+    func renderDetail(url: URL, settings: EditSettings, rects: [CGRect], colorSpace: CGColorSpace) -> DetailResult? {
         guard let source = source(for: url, maxPixelSize: .infinity) else { return nil }
         source.ensureLongEdge(.infinity)
-        guard let (image, _) = ImagePipeline.render(source, settings: settings, geometry: geometry, context: context) else { return nil }
+        guard let (image, _) = ImagePipeline.render(source, settings: settings, geometry: true, context: context) else { return nil }
         let extent = image.extent
         let fullSize = extent.size
         let pieces = rects.compactMap { rect -> (CGImage, CGRect)? in

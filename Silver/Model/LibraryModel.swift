@@ -124,13 +124,15 @@ final class LibraryModel {
     nonisolated struct PreviewKey: Equatable, Sendable {
         let settings: EditSettings
         let geometry: Bool
+        /// Show Original: the photo's crop and straighten without its adjustments.
+        let original: Bool
         let pixelSize: CGFloat
         let colorSpace: CGColorSpace
     }
 
     /// Recent previews, most recent last: photos just shown, and the ones next to the active
-    /// photo, rendered ahead of time. One per photo and kind (with or without crop), so a
-    /// slider drag replaces its entry instead of pushing the others out.
+    /// photo, rendered ahead of time. One per photo and kind (with or without crop, or the
+    /// original), so a slider drag replaces its entry instead of pushing the others out.
     private var previewCache: [(id: Photo.ID, key: PreviewKey, result: PreviewResult)] = []
     private static let previewCacheLimit = 6
     private var prefetchTask: Task<Void, Never>?
@@ -739,7 +741,7 @@ final class LibraryModel {
         }
         guard viewMode == .loupe || forThumbnail else { return }
         let original = showOriginal
-        let geometry = !isCropping && !original
+        let geometry = !isCropping
         let key = previewKey(for: photo, original: original, geometry: geometry)
         previewSequence += 1
         if let cached = cachedPreview(for: photo, key: key) {
@@ -795,7 +797,7 @@ final class LibraryModel {
             showPreview(result, for: photo, geometry: request.key.geometry)
         }
         // Once a slider drag pauses.
-        if isLast, request.key.geometry {
+        if isLast, request.key.geometry, !request.key.original {
             scheduleThumbnailRefresh(for: photo, settings: request.key.settings)
         }
     }
@@ -829,8 +831,9 @@ final class LibraryModel {
 
     private func previewKey(for photo: Photo, original: Bool = false, geometry: Bool = true) -> PreviewKey {
         PreviewKey(
-            settings: original ? .default : photo.settings,
+            settings: original ? photo.settings.original : photo.settings,
             geometry: geometry,
+            original: original,
             pixelSize: previewPixelSize,
             colorSpace: displayColorSpace
         )
@@ -841,7 +844,7 @@ final class LibraryModel {
     }
 
     private func storePreview(_ result: PreviewResult, for photo: Photo, key: PreviewKey) {
-        previewCache.removeAll { $0.id == photo.id && $0.key.geometry == key.geometry }
+        previewCache.removeAll { $0.id == photo.id && $0.key.geometry == key.geometry && $0.key.original == key.original }
         previewCache.append((photo.id, key, result))
         if previewCache.count > Self.previewCacheLimit { previewCache.removeFirst() }
     }
@@ -1059,7 +1062,7 @@ final class LibraryModel {
     /// Whether `detail` shows the active photo with its current settings.
     private var isDetailCurrent: Bool {
         guard let photo = activePhoto, let rendering = detailRendering, detail.first?.photoID == photo.id else { return false }
-        return rendering.original == showOriginal && rendering.settings == (showOriginal ? .default : photo.settings)
+        return rendering.original == showOriginal && rendering.settings == (showOriginal ? photo.settings.original : photo.settings)
     }
 
     /// Tiles whose part inside `coverage` the rendered parts don't cover, merged into rows and then
@@ -1126,7 +1129,7 @@ final class LibraryModel {
                     _ = await prefetching.task.value
                 }
                 let original = showOriginal
-                let settings = original ? EditSettings.default : photo.settings
+                let settings = original ? photo.settings.original : photo.settings
                 // An edit re-renders everything shown in one go, which Core Image can cache for
                 // the next step of a slider drag; a pan adds the tiles it uncovers.
                 let isPan = isDetailCurrent
@@ -1141,7 +1144,6 @@ final class LibraryModel {
                 let result = await renderer.renderDetail(
                     url: photo.url,
                     settings: settings,
-                    geometry: !original,
                     rects: rects,
                     colorSpace: displayColorSpace
                 )

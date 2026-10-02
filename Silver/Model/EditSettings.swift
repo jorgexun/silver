@@ -29,6 +29,9 @@ nonisolated struct EditSettings: Equatable, Hashable, Sendable {
 
     var hasGeometry: Bool { crop != .full || straighten != 0 }
 
+    /// The photo as shot, with only this crop and straighten: what Show Original shows.
+    var original: EditSettings { EditSettings.default.merging(.geometry, from: self) }
+
     /// Returns a copy with the given groups taken from `source`.
     func merging(_ groups: AdjustmentGroups, from source: EditSettings) -> EditSettings {
         var result = self
