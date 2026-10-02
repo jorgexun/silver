@@ -40,6 +40,8 @@ private struct PreviewCanvas: View {
     /// Set when zooming in from the fit view, until the zoomed view knows where the image goes.
     @State private var animatesZoomIn = false
     @State private var transition: ZoomTransition?
+    /// A single click waiting to see whether it becomes a double-click.
+    @State private var pendingClick: Task<Void, Never>?
 
     var body: some View {
         let preview = library.preview?.photoID == photo.id ? library.preview : nil
@@ -48,7 +50,7 @@ private struct PreviewCanvas: View {
         let isZoomed = library.zoom?.photoID == photo.id
         Group {
             if let zoom = library.zoom, isZoomed {
-                ZoomedCanvas(zoom: zoom, base: image, dragStart: $panStart, tracker: zoomed) { frame in
+                ZoomedCanvas(zoom: zoom, base: image, dragStart: $panStart, tracker: zoomed, onClick: { click { library.exitZoom() } }) { frame in
                     guard animatesZoomIn else { return }
                     animatesZoomIn = false
                     transition = ZoomTransition(base: image, detail: [], frame: frame, zoomingIn: true)
@@ -76,6 +78,7 @@ private struct PreviewCanvas: View {
                 transition = ZoomTransition(base: image, detail: detail, frame: frame, zoomingIn: false)
             }
         }
+        .onDisappear { pendingClick?.cancel() }
         // On the container, so the cursor follows a click that zooms in or out.
         .cursor(cursor(isZoomed: isZoomed, hasImage: image != nil))
         .contextMenu { PhotoContextMenu(photo: photo) }
@@ -85,6 +88,24 @@ private struct PreviewCanvas: View {
                     .canvasLabel()
                     .padding(.top, 12)
             }
+        }
+    }
+
+    /// Runs `action` for a single click, once a double-click (back to the grid) is ruled out.
+    /// Waits 0.25 s, not the 0.35 s a SwiftUI double-tap gesture holds back a single tap. A
+    /// slower double-click still goes to the grid by its click count, after the single click acted.
+    private func click(_ action: @escaping () -> Void) {
+        pendingClick?.cancel()
+        pendingClick = nil
+        if let event = NSApp.currentEvent, event.clickCount >= 2 {
+            library.viewMode = .grid
+            return
+        }
+        pendingClick = Task {
+            try? await Task.sleep(for: .seconds(min(NSEvent.doubleClickInterval, 0.25)))
+            guard !Task.isCancelled else { return }
+            pendingClick = nil
+            action()
         }
     }
 
@@ -112,10 +133,8 @@ private struct PreviewCanvas: View {
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
             .contentShape(Rectangle())
-            // Declared first, so a single click waits until it can't be a double-click.
-            .onTapGesture(count: 2) { library.viewMode = .grid }
             .onTapGesture(coordinateSpace: .local) { location in
-                zoom(at: location, frame: frame, canvas: geometry.size)
+                click { zoom(at: location, frame: frame, canvas: geometry.size) }
             }
             // Pinching out zooms to 100% where the fingers are, as in Photos.
             .simultaneousGesture(MagnifyGesture().onEnded { value in
@@ -145,6 +164,7 @@ private struct ZoomedCanvas: View {
     let base: CGImage?
     @Binding var dragStart: CGPoint?
     let tracker: ZoomedTracker
+    let onClick: () -> Void
     /// Called once the image's place at 100% is known, before it is first shown there.
     let onPlaced: (ZoomedFrame) -> Void
 
@@ -180,8 +200,7 @@ private struct ZoomedCanvas: View {
                     .padding(.horizontal, inset.width)
                     .padding(.vertical, inset.height)
                     .contentShape(Rectangle())
-                    .onTapGesture(count: 2) { library.viewMode = .grid }
-                    .onTapGesture { library.exitZoom() }
+                    .onTapGesture(perform: onClick)
                     .gesture(
                         // Global coordinates: the content moves while it scrolls, so local
                         // translations would feed back into the scroll position.
