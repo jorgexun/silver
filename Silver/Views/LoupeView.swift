@@ -46,7 +46,10 @@ private struct PreviewCanvas: View {
     var body: some View {
         let preview = library.preview?.photoID == photo.id ? library.preview : nil
         let placeholder = library.placeholder?.photoID == photo.id ? library.placeholder : nil
-        let image = preview?.image ?? placeholder?.image ?? photo.thumbnail
+        // Right after cropping, until the cropped preview has rendered, the crop editor's preview
+        // is cropped here, so the whole photo doesn't flash up.
+        let uncropped = preview?.hasGeometry == false ? preview?.image : nil
+        let image = (uncropped == nil ? preview?.image : nil) ?? placeholder?.image ?? photo.thumbnail
         let isZoomed = library.zoom?.photoID == photo.id
         Group {
             if let zoom = library.zoom, isZoomed {
@@ -57,7 +60,7 @@ private struct PreviewCanvas: View {
                 }
                 .id(zoom.photoID)  // Fresh scroll state for each photo.
             } else {
-                fitCanvas(image: image)
+                fitCanvas(image: image, uncropped: uncropped)
             }
         }
         .overlay {
@@ -80,7 +83,7 @@ private struct PreviewCanvas: View {
         }
         .onDisappear { pendingClick?.cancel() }
         // On the container, so the cursor follows a click that zooms in or out.
-        .cursor(cursor(isZoomed: isZoomed, hasImage: image != nil))
+        .cursor(cursor(isZoomed: isZoomed, hasImage: (uncropped ?? image) != nil))
         .contextMenu { PhotoContextMenu(photo: photo) }
         .overlay(alignment: .top) {
             if library.showOriginal {
@@ -114,12 +117,17 @@ private struct PreviewCanvas: View {
         return hasImage ? .zoomIn : .arrow
     }
 
-    private func fitCanvas(image: CGImage?) -> some View {
+    private func fitCanvas(image: CGImage?, uncropped: CGImage?) -> some View {
         GeometryReader { geometry in
             let padding: CGFloat = 28
-            let frame = image.map { fitRect(CGSize(width: $0.width, height: $0.height), in: geometry.size, padding: padding) }
+            let crop = photo.settings.crop
+            let frame = uncropped.map {
+                fitRect(CGSize(width: crop.width * Double($0.width), height: crop.height * Double($0.height)), in: geometry.size, padding: padding)
+            } ?? image.map { fitRect(CGSize(width: $0.width, height: $0.height), in: geometry.size, padding: padding) }
             ZStack {
-                if let image {
+                if let uncropped, let frame {
+                    croppedImage(uncropped, in: frame)
+                } else if let image {
                     Image(decorative: image, scale: 1)
                         .resizable()
                         .interpolation(.high)
@@ -138,6 +146,24 @@ private struct PreviewCanvas: View {
                 if value.magnification > 1.15 { zoom(at: value.startLocation, frame: frame, canvas: geometry.size) }
             })
         }
+    }
+
+    /// A preview without crop and straighten, turned and cropped the way the crop editor shows it,
+    /// filling `frame`.
+    private func croppedImage(_ image: CGImage, in frame: CGRect) -> some View {
+        let settings = photo.settings
+        let crop = settings.crop
+        let size = CGSize(width: frame.width / crop.width, height: frame.height / crop.height)
+        return Image(decorative: image, scale: 1)
+            .resizable()
+            .interpolation(.high)
+            .frame(width: size.width, height: size.height)
+            .rotationEffect(.degrees(settings.straighten))
+            .offset(x: (0.5 - crop.midX) * size.width, y: (0.5 - crop.midY) * size.height)
+            .frame(width: frame.width, height: frame.height)
+            .clipped()
+            .shadow(color: .black.opacity(0.4), radius: 8)
+            .position(x: frame.midX, y: frame.midY)
     }
 
     /// Zooms to 100% keeping the image point at `location` under it.
