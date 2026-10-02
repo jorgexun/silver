@@ -57,7 +57,7 @@ private struct PreviewCanvas: View {
                 }
                 .id(zoom.photoID)  // Fresh scroll state for each photo.
             } else {
-                fitCanvas(image: image, isLoading: preview == nil)
+                fitCanvas(image: image)
             }
         }
         .overlay {
@@ -114,7 +114,7 @@ private struct PreviewCanvas: View {
         return hasImage ? .zoomIn : .arrow
     }
 
-    private func fitCanvas(image: CGImage?, isLoading: Bool) -> some View {
+    private func fitCanvas(image: CGImage?) -> some View {
         GeometryReader { geometry in
             let padding: CGFloat = 28
             let frame = image.map { fitRect(CGSize(width: $0.width, height: $0.height), in: geometry.size, padding: padding) }
@@ -126,9 +126,6 @@ private struct PreviewCanvas: View {
                         .aspectRatio(contentMode: .fit)
                         .shadow(color: .black.opacity(0.4), radius: 8)
                         .padding(padding)
-                }
-                if isLoading {
-                    LoadingIndicator()
                 }
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
@@ -261,7 +258,6 @@ private struct ZoomedCanvas: View {
                             .aspectRatio(contentMode: .fit)
                             .padding(28)
                     }
-                    LoadingIndicator()
                 }
                 .frame(width: geometry.size.width, height: geometry.size.height)
             }
@@ -277,27 +273,6 @@ private struct ZoomedCanvas: View {
             width: geometry.containerSize.width,
             height: geometry.containerSize.height
         )
-    }
-}
-
-/// Shown while a render is on its way. It appears only after a moment, so it doesn't flash
-/// when switching between photos quickly.
-private struct LoadingIndicator: View {
-    @State private var isVisible = false
-
-    var body: some View {
-        ZStack {
-            if isVisible {
-                ProgressView()
-                    .controlSize(.small)
-                    .padding(10)
-                    .glassEffect(.regular, in: .circle)
-            }
-        }
-        .task {
-            try? await Task.sleep(for: .milliseconds(300))
-            isVisible = true
-        }
     }
 }
 
