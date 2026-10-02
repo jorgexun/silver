@@ -23,7 +23,7 @@ struct GridView: View {
                                 isSelected: library.selection.contains(photo.id),
                                 isActive: library.activeID == photo.id
                             )
-                            .frame(height: size + 22)
+                            .frame(height: size)
                             .id(photo.id)
                             .onTapGesture(count: 2) { library.open(photo) }
                             .simultaneousGesture(TapGesture().onEnded {
@@ -102,7 +102,7 @@ struct GridView: View {
 }
 
 /// A photo in the grid. A tile appears behind it on hover and selection, with a ring when
-/// selected that is strongest for the active photo.
+/// selected that is strongest for the active photo. The name shows on hover.
 struct ThumbnailCell: View {
     let photo: Photo
     let isSelected: Bool
@@ -110,32 +110,24 @@ struct ThumbnailCell: View {
     @State private var isHovering = false
 
     var body: some View {
-        VStack(spacing: 4) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color.white.opacity(isActive ? 0.16 : isSelected ? 0.1 : isHovering ? 0.05 : 0))
-                if let thumbnail = photo.thumbnail {
-                    Image(decorative: thumbnail, scale: 1)
-                        .resizable()
-                        .interpolation(.high)
-                        .aspectRatio(contentMode: .fit)
-                        .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
-                        .overlay(alignment: .bottomTrailing) {
-                            if photo.isEdited { EditedBadge().padding(5) }
-                        }
-                        .padding(10)
-                } else {
-                    ProgressView().controlSize(.small)
-                }
+        ZStack {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.white.opacity(isActive ? 0.16 : isSelected ? 0.1 : isHovering ? 0.05 : 0))
+            if let thumbnail = photo.thumbnail {
+                Image(decorative: thumbnail, scale: 1)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
+                    .overlay(alignment: .bottomTrailing) {
+                        if photo.isEdited { EditedBadge().padding(5) }
+                    }
+                    .padding(10)
+            } else {
+                ProgressView().controlSize(.small)
             }
-            .selectionRing(isSelected, isActive: isActive, cornerRadius: 8)
-
-            Text(photo.name)
-                .font(.caption)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .foregroundStyle(isSelected ? .primary : .secondary)
         }
+        .selectionRing(isSelected, isActive: isActive, cornerRadius: 8)
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
         .help(photo.name)
