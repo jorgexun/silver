@@ -41,15 +41,16 @@ static float ramp(float x) {
 }
 
 /// `rgbTone` after the local exposure change of Highlights and Shadows. `coefficients` holds
-/// the guided filter's (a, b), scaled up to the image, so `a · L + b` is the edge-aware local
-/// average of log2 luminance L; `offset` places it relative to mid gray after exposure. The
+/// the guided filter's (a, b) at low resolution; `mapping` (scale in xy, offset in zw) takes image
+/// coordinates to its coordinates. `a · L + b` is then the edge-aware local average of log2
+/// luminance L, and `offset` places it relative to mid gray after exposure. The
 /// change in stops grows with the average's distance from mid gray, scaled by `highlights`
 /// above it and `shadows` below it (at most 4 stops of distance). All channels get the same
 /// gain, so hue is kept, and detail within a region keeps its contrast.
 float4 rgbToneLocal(sampler image, sampler coefficients, sampler table, float maxEncoded, float count,
-                    float offset, float highlights, float shadows, destination dest) {
+                    float offset, float highlights, float shadows, float4 mapping, destination dest) {
     float4 pixel = image.sample(image.coord());
-    float2 ab = coefficients.sample(coefficients.transform(dest.coord())).rg;
+    float2 ab = coefficients.sample(coefficients.transform(dest.coord() * mapping.xy + mapping.zw)).rg;
     float stops = ab.x * logLuminance(pixel.rgb) + ab.y + offset;
     float delta = highlights * ramp(stops) + shadows * min(ramp(-stops), 4.0f);
     return float4(applyTone(pixel.rgb * exp2(delta), table, maxEncoded, count), pixel.a);

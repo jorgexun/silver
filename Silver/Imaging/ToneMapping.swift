@@ -50,21 +50,22 @@ nonisolated enum ToneMapping {
                 arguments: [image, table, maxEncoded, Float(samples)]
             ) ?? image
         }
-        // Stretch the coefficients over the image; they are sampled bilinearly.
+        // The kernel maps image coordinates to the small coefficient image and samples it
+        // bilinearly. Scaling the image itself up instead makes Core Image render it at full
+        // size for every render: about 45 ms per slider step at 100%.
         let small = local.coefficients.extent
-        let coefficients = local.coefficients
-            .clampedToExtent()
-            .samplingLinear()
-            .transformed(by: CGAffineTransform(translationX: extent.minX, y: extent.minY)
-                .scaledBy(x: extent.width / small.width, y: extent.height / small.height)
-                .translatedBy(x: -small.minX, y: -small.minY))
+        let toSmall = CGAffineTransform(translationX: small.minX, y: small.minY)
+            .scaledBy(x: small.width / extent.width, y: small.height / extent.height)
+            .translatedBy(x: -extent.minX, y: -extent.minY)
+        let coefficients = local.coefficients.clampedToExtent().samplingLinear()
         return kernels.local.apply(
             extent: extent,
-            roiCallback: { index, rect in index == 0 ? rect : index == 1 ? rect.insetBy(dx: -1, dy: -1) : tableExtent },
+            roiCallback: { index, rect in index == 0 ? rect : index == 1 ? rect.applying(toSmall).insetBy(dx: -1, dy: -1) : tableExtent },
             arguments: [
                 image, coefficients, table, maxEncoded, Float(samples), Float(exposure - log2(0.18)),
                 Float(clamp(local.highlights, -100, 100) / 100 * localStrength),
                 Float(clamp(local.shadows, -100, 100) / 100 * localStrength),
+                CIVector(x: toSmall.a, y: toSmall.d, z: toSmall.tx, w: toSmall.ty),
             ]
         ) ?? image
     }
