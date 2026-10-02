@@ -21,7 +21,7 @@ There is no test target and no linter. The imaging and model code is `nonisolate
 cd Silver
 swiftc -O -o /tmp/harness \
   Model/EditSettings.swift Imaging/CropGeometry.swift Imaging/ImagePipeline.swift Imaging/ToneMapping.swift \
-  Imaging/Thumbnails.swift Model/Exporter.swift Model/Sidecar.swift \
+  Imaging/LocalTone.swift Imaging/Thumbnails.swift Model/Exporter.swift Model/Sidecar.swift \
   /path/to/main.swift            # add Model/Bookmarks.swift Model/SourceFolders.swift for sidebar logic
 ```
 
@@ -33,6 +33,7 @@ Views can be checked the same way, without a display:
 - Mouse and key events sent with `window.sendEvent` drive SwiftUI gestures and text fields. AppKit tracking loops, such as split view dividers, need the drag and mouse-up queued with `NSApp.postEvent` first.
 - Events sent with `window.sendEvent` don't set `NSApp.currentEvent`, where the crop editor reads modifier keys from. Queue those drags with `NSApp.postEvent` to test ⇧, ⌥ and ⌘.
 - Menu commands aren't in the harness. Test them on the app itself with `CGEvent.postToPid`, which reaches a background instance without touching the frontmost app.
+- A background instance has no key window, so ⌘W does nothing there: close the window by pressing its close button through Accessibility. Reopen it with a `kAEReopenApplication` Apple Event sent to the instance's process ID; `open` may reach another running copy of Silver. Killing an instance right after reopening its window can leave saved state with no window, so the next launch opens none.
 - Glass and sidebar vibrancy don't render this way.
 - Drive the harness from a `Task { @MainActor in … }` that waits with `Task.sleep`. Pumping `RunLoop` inside `DispatchQueue.main.async` never runs the model's main-actor tasks.
 - Synthetic drags and scroll-wheel events didn't reach the zoomed `ScrollView`. To pan at 100%, find its `NSScrollView` and move the clip view (`contentView.scroll(to:)` plus `reflectScrolledClipView`), kept within the document.
@@ -83,7 +84,7 @@ JPEG sources use `CITemperatureAndTint` for white balance and the same kernels w
 
 **Loading and editing photos.** Opening a 60 MP M11 DNG takes about 0.8 s: 0.1 s to create the `CIRAWFilter`, 0.6 s of single-threaded decompression on the CPU, and 0.15 s of demosaicing on the GPU. The decompressed RAW stays in the `CIRAWFilter`, so later renders of the same `SourceImage`, in any context or at any scale, cost only the GPU part. A `CIContext` runs one render at a time, and a second context costs up to 2 GB.
 - `PreviewRenderer` keeps 5 decoded sources (about 190 MB each). Its `prefetch` decodes a photo and renders its preview on a separate low-priority context without caching intermediates, then hands the source to the actor. Prefetching doesn't hold up renders of the photo being edited.
-- `LibraryModel` keeps a small preview cache (one entry per photo and kind, with or without crop), keyed by settings, pixel size and color space. Photos next to the active one in the loupe, or the selected one in the grid (after 0.3 s), are prefetched into it once the active photo has rendered, so stepping through photos shows them at once. Cached previews also make `\` and undo instant. After showing a cached preview, the photo is rendered again in the preview's context while nothing waits on it, so the first slider step is fast.
+- `LibraryModel` keeps a small preview cache (one entry per photo and kind: with or without crop, or the original), keyed by settings, pixel size and color space. Photos next to the active one in the loupe, or the selected one in the grid (after 0.3 s), are prefetched into it once the active photo has rendered, so stepping through photos shows them at once. Cached previews also make `\` and undo instant. After showing a cached preview, the photo is rendered again in the preview's context while nothing waits on it, so the first slider step is fast.
 - Until an unedited RAW photo has rendered, the loupe shows its embedded camera JPEG at screen size (`Thumbnails.screenPreview`, about 0.15 s), not the small thumbnail. Edited photos show their thumbnail, which has the edits.
 - When photos are stepped through faster than every 0.25 s, decoding waits until stepping pauses for 0.2 s. A decode can't be stopped, so decoding each photo passed would hold up the one the user stops at.
 - Preview renders run in a loop off the main actor that takes the newest request from `PreviewQueue`. A render therefore starts as soon as an edit asks for it, not after the main actor has updated the views for that edit, which used to add 5–25 ms per slider step.
@@ -112,6 +113,7 @@ JPEG sources use `CITemperatureAndTint` for white balance and the same kernels w
 
 **Interactions.** Where Lightroom and Photos agree, Silver follows them.
 - Every keyboard shortcut is a menu command, so it shows in the menu bar and works regardless of focus. Commands that toggle ignore key auto-repeat (`ignoringRepeats`).
+- Closing the window (⌘W or the close button) keeps the app running, as is usual on the Mac; the Dock icon or the Window menu reopens it with its state. While it's closed, `isWindowOpen` is false and every menu command is disabled, so nothing changes photos out of sight. `applicationShouldTerminateAfterLastWindowClosed` must return false: SwiftUI otherwise quits an app whose only scene is a `Window`.
 - Paste, Reset and Export commands act on all selected photos, and their labels give the count when it's more than one. In the inspector, Reset and the reset icons act on the photo shown.
 - Context-menu commands act on the selection when the clicked photo is in it, otherwise on just that photo (`contextTargets`), without changing the selection.
 - In the loupe, a click toggles 100% and a double-click returns to the grid. The click waits 0.25 s for a second click itself (`PreviewCanvas.click`), not via `onTapGesture(count: 2)`, which holds a single tap back about 0.35 s. A slower double-click still reaches the grid by its `clickCount`, after the first click has acted.

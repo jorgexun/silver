@@ -264,7 +264,7 @@ DNG SDK 只是参考渲染。Lightroom 从 PV2012（Lightroom 4，2012）开始�
 
 §6 建议的实施情况：
 - **第 1–4 条已实施**（commit `2975815`）。其中白点最终采用固定场景白 6.0：按图测量白点每张照片要多花约 0.12 s，所以放弃了。
-- **第 5、6 条暂缓，尚未开发。**
+- **第 5 条已于 2026-10-02 实施**（局部 Highlights / Shadows，commit `f25d9f4`、`2aca3bc`），方案与附录 A 不同之处见附录 B。**第 6 条（Whites / Blacks）仍暂缓。**
 
 以下是第 5 条（局部 Highlights / Shadows）确定的方案，思路与 darktable tone equalizer 相同，是 Lightroom Local Laplacian 效果的单尺度近似：
 
