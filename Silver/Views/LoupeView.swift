@@ -266,7 +266,7 @@ private struct ZoomedCanvas: View {
 
     /// The area not covered by the sidebar, inspector or toolbar, in content coordinates. Its
     /// origin is the point `scrollTo(point:)` takes; `visibleRect` also covers the insets.
-    private static func visibleArea(_ geometry: ScrollGeometry) -> CGRect {
+    private nonisolated static func visibleArea(_ geometry: ScrollGeometry) -> CGRect {
         CGRect(
             x: geometry.contentOffset.x + geometry.contentInsets.leading,
             y: geometry.contentOffset.y + geometry.contentInsets.top,
