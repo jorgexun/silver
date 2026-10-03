@@ -227,30 +227,44 @@ final class ExportModel {
         let policy = isTemporary ? .overwrite : batch.options.existingFilePolicy
 
         var reserved = Set<String>()
-        // The previous photo going into Photos, while the next one renders.
+        // Photos go into Photos one after another, while the next ones render.
         var adding: Task<Void, Never>?
-        for job in batch.jobs {
-            if Task.isCancelled { break }
-            progress?.current = job.source.lastPathComponent
-            defer { progress?.completed += 1 }
-            let destination: URL
-            do {
-                // Off the main actor, file checks included. The export context's GPU work runs
-                // at low priority, below the previews.
-                destination = try await Task.detached(priority: .utility) { [reserved] in
-                    let destination = Exporter.destination(for: job.source, in: folder, policy: policy, reserved: reserved)
-                    try Exporter.export(job, to: destination, options: batch.options)
-                    return destination
-                }.value
-            } catch {
-                summary.failures.append(ExportFailure(fileName: job.source.lastPathComponent, message: error.localizedDescription))
-                continue
-            }
-            reserved.insert(destination.lastPathComponent.lowercased())
-            if !isTemporary { summary.exported.append(destination) }
-            if batch.toPhotos {
-                await adding?.value
-                adding = Task { await addToPhotos(destination, moving: isTemporary, name: job.source.lastPathComponent) }
+        var pending = batch.jobs[...]
+        var running = 0
+
+        await withTaskGroup(of: (name: String, result: Result<URL, Error>).self) { group in
+            while true {
+                // Starts photos while fewer than the export contexts are exporting.
+                while !Task.isCancelled, running < Exporter.contexts.count, let job = pending.popFirst() {
+                    let name = job.source.lastPathComponent
+                    // Off the main actor, like the file checks. Names are reserved before the
+                    // export starts, so photos exported at the same time don't take the same one.
+                    let destination = await Task.detached(priority: .utility) { [reserved] in
+                        Exporter.destination(for: job.source, in: folder, policy: policy, reserved: reserved)
+                    }.value
+                    reserved.insert(destination.lastPathComponent.lowercased())
+                    running += 1
+                    progress?.current = name
+                    // Off the main actor too; the export contexts' GPU work runs at low priority.
+                    group.addTask(priority: .utility) {
+                        (name, Result { try Exporter.export(job, to: destination, options: batch.options) }.map { destination })
+                    }
+                }
+                guard let finished = await group.next() else { break }
+                running -= 1
+                progress?.completed += 1
+                switch finished.result {
+                case .success(let destination):
+                    if !isTemporary { summary.exported.append(destination) }
+                    if batch.toPhotos {
+                        adding = Task { [previous = adding] in
+                            await previous?.value
+                            await addToPhotos(destination, moving: isTemporary, name: finished.name)
+                        }
+                    }
+                case .failure(let error):
+                    summary.failures.append(ExportFailure(fileName: finished.name, message: error.localizedDescription))
+                }
             }
         }
         // Before the temporary folder is removed.
@@ -266,7 +280,7 @@ final class ExportModel {
         }
     }
 
-    /// Stops after the photo being exported, and drops the queued exports.
+    /// Stops after the photos being exported, and drops the queued exports.
     func cancel() {
         task?.cancel()
     }

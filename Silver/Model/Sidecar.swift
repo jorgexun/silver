@@ -4,17 +4,19 @@ import Foundation
 nonisolated enum Sidecar {
     static let suffix = ".edit.json"
 
-    /// `L1001234.DNG` → `L1001234.edit.json`.
+    /// The sidecar of each photo in a folder, in the same order: `L1001234.DNG` → `L1001234.edit.json`.
     /// When a DNG and a JPG share a base name (RAW+JPG shooting), the DNG keeps the short
     /// name and the other file uses `L1001234.JPG.edit.json`.
-    static func url(for photoURL: URL, in folderFiles: [URL]) -> URL {
-        let base = photoURL.deletingPathExtension().lastPathComponent
-        let siblings = folderFiles.filter {
-            $0 != photoURL && $0.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(base) == .orderedSame
+    static func urls(for folderFiles: [URL]) -> [URL] {
+        // Grouped by base name: comparing every photo with every other took 4.4 s for 2,000 photos.
+        let groups = Dictionary(grouping: folderFiles) { $0.deletingPathExtension().lastPathComponent.lowercased() }
+        return folderFiles.map { photoURL in
+            let base = photoURL.deletingPathExtension().lastPathComponent
+            let siblings = groups[base.lowercased(), default: []].filter { $0 != photoURL }
+            let ownsShortName = siblings.isEmpty || (PhotoFile.isRaw(photoURL) && !siblings.contains(where: { PhotoFile.isRaw($0) }))
+            let name = ownsShortName ? base + suffix : photoURL.lastPathComponent + suffix
+            return photoURL.deletingLastPathComponent().appendingPathComponent(name)
         }
-        let ownsShortName = siblings.isEmpty || (PhotoFile.isRaw(photoURL) && !siblings.contains(where: { PhotoFile.isRaw($0) }))
-        let name = ownsShortName ? base + suffix : photoURL.lastPathComponent + suffix
-        return photoURL.deletingLastPathComponent().appendingPathComponent(name)
     }
 
     static func load(from url: URL) -> EditSettings? {

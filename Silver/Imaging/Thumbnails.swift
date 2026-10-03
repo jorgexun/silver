@@ -5,7 +5,9 @@ import ImageIO
 nonisolated enum Thumbnails {
     static let maxPixelSize: CGFloat = 480
 
-    private static let context = CIContext(options: [.name: "Silver.Thumbnails", .cacheIntermediates: false])
+    /// For rendered thumbnails. Two at once rendered 12 edited M11 thumbnails in 5.7 s instead
+    /// of 10.4 s, with about 0.7 GB more peak memory.
+    static let contexts = ContextPool(name: "Silver.Thumbnails", count: 2)
 
     /// Fast thumbnail from the file's embedded preview.
     static func embedded(url: URL) -> CGImage? {
@@ -45,6 +47,10 @@ nonisolated enum Thumbnails {
 
     /// Thumbnail rendered through the edit pipeline.
     static func rendered(url: URL, settings: EditSettings) -> CGImage? {
+        contexts.withContext { rendered(url: url, settings: settings, context: $0) }
+    }
+
+    private static func rendered(url: URL, settings: EditSettings, context: CIContext) -> CGImage? {
         // Oversample 2x for a crisper downscale.
         guard let source = SourceImage(url: url, maxPixelSize: maxPixelSize * 2) else { return nil }
         source.ensureLongEdge(source.longEdgeNeeded(for: settings.crop, outputPixelSize: maxPixelSize * 2))

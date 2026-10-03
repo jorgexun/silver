@@ -28,14 +28,9 @@ private nonisolated struct SourceBox: @unchecked Sendable {
 /// recent photos and dragging sliders stays fast.
 actor PreviewRenderer {
     private let context = CIContext(options: [.name: "Silver.Preview"])
-    /// A context runs one render at a time, so prefetching has its own: decoding the next photo
-    /// doesn't hold up renders of the one being edited. It renders each photo once, so it keeps
-    /// no intermediates, and it gives way to the preview on the GPU.
-    private nonisolated let prefetchContext = CIContext(options: [
-        .name: "Silver.Prefetch",
-        .cacheIntermediates: false,
-        .priorityRequestLow: true,
-    ])
+    /// Apart from the preview's context, so decoding the next photos doesn't hold up renders of
+    /// the one being edited. Two at once keep up with stepping through photos about twice as fast.
+    nonisolated let prefetchContexts = ContextPool(name: "Silver.Prefetch", count: 2)
     private var sources: [SourceImage] = []
     /// About 190 MB each for M11 files: the photo shown, the ones next to it and recent ones.
     private let cacheLimit = 5
@@ -60,7 +55,9 @@ actor PreviewRenderer {
     /// of a 0.8 s open for M11 files).
     @concurrent nonisolated func prefetch(url: URL, settings: EditSettings, maxPixelSize: CGFloat, colorSpace: CGColorSpace) async -> PreviewResult? {
         guard let box = await take(url) ?? SourceImage(url: url, maxPixelSize: maxPixelSize).map(SourceBox.init) else { return nil }
-        let result = Self.renderPreview(box.source, settings: settings, geometry: true, maxPixelSize: maxPixelSize, context: prefetchContext, colorSpace: colorSpace)
+        let result = prefetchContexts.withContext {
+            Self.renderPreview(box.source, settings: settings, geometry: true, maxPixelSize: maxPixelSize, context: $0, colorSpace: colorSpace)
+        }
         await adopt(box)
         return result?.0
     }

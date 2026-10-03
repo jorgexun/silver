@@ -44,9 +44,11 @@ nonisolated enum ExportError: LocalizedError {
 
 /// Renders full-resolution sRGB JPEGs.
 nonisolated enum Exporter {
-    /// Low priority, like prefetching: exports run in the background while previews render.
-    /// Measured idle, it costs nothing (1.65 s for three M11 photos either way).
-    private static let context = CIContext(options: [.name: "Silver.Export", .cacheIntermediates: false, .priorityRequestLow: true])
+    /// Two photos at once exported 8 edited M11 photos in 4.4 s instead of 7.7 s, with up to
+    /// 0.8 GB more peak memory; a third gained much less. Low priority runs exports in the
+    /// background while previews render; measured idle, it costs nothing (1.65 s for three M11
+    /// photos either way).
+    static let contexts = ContextPool(name: "Silver.Export", count: 2)
 
     /// The name an export of `source` starts from.
     static func fileName(for source: URL) -> String {
@@ -71,6 +73,10 @@ nonisolated enum Exporter {
     }
 
     static func export(_ job: ExportJob, to destination: URL, options: ExportOptions) throws {
+        try contexts.withContext { try export(job, to: destination, options: options, context: $0) }
+    }
+
+    private static func export(_ job: ExportJob, to destination: URL, options: ExportOptions, context: CIContext) throws {
         guard let source = SourceImage(url: job.source, maxPixelSize: nil) else { throw ExportError.cannotDecode }
         guard let (image, _) = ImagePipeline.render(source, settings: job.settings, geometry: true, context: context),
               let cgImage = context.createCGImage(image, from: image.extent, format: .RGBA8, colorSpace: ImagePipeline.sRGB)

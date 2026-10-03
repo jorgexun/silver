@@ -157,9 +157,10 @@ final class LibraryModel {
     /// original), so a slider drag replaces its entry instead of pushing the others out.
     private var previewCache: [(id: Photo.ID, key: PreviewKey, result: PreviewResult)] = []
     private static let previewCacheLimit = 6
-    private var prefetchTask: Task<Void, Never>?
-    /// The photo being prefetched; showing it waits for that instead of decoding it again.
-    private var prefetching: (id: Photo.ID, key: PreviewKey, task: Task<PreviewResult?, Never>)?
+    /// Waits for the selection in the grid to settle before prefetching.
+    private var prefetchDelay: Task<Void, Never>?
+    /// Photos being prefetched; showing one waits for that instead of decoding it again.
+    private var prefetching: [(id: Photo.ID, key: PreviewKey, task: Task<PreviewResult?, Never>)] = []
     private var prefetchFailures: Set<Photo.ID> = []
     /// Direction of the last step through the photos, so the photo coming next is prefetched first.
     private var stepDirection = 1
@@ -325,6 +326,9 @@ final class LibraryModel {
         folderURL = url
         isScanning = true
         viewMode = keepState ? viewMode : .grid
+        // Decoded photos of the folder shown, or of the files before a reload. Not awaited: a
+        // decode in progress would hold up the new folder until it's done, up to 0.8 s.
+        Task { [renderer] in await renderer.removeAll() }
 
         Task {
             let (entries, cached) = await Task.detached(priority: .userInitiated) {
@@ -333,7 +337,6 @@ final class LibraryModel {
                 return (entries, Self.cachedThumbnails(of: entries, around: start))
             }.value
             guard folderURL == url else { return }
-            await renderer.removeAll()
             photos = entries.map { Photo(url: $0.url, sidecarURL: $0.sidecar, settings: $0.settings) }
             photosByID = Dictionary(uniqueKeysWithValues: photos.map { ($0.id, $0) })
             for (id, entry) in cached { photosByID[id]?.showThumbnail(entry.image, settings: entry.settings) }
@@ -390,9 +393,11 @@ final class LibraryModel {
         let files = contents
             .filter { PhotoFile.isSupported($0) }
             .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
-        return files.map { file in
-            let sidecar = Sidecar.url(for: file, in: files)
-            return ScanEntry(url: file, sidecar: sidecar, settings: Sidecar.load(from: sidecar) ?? .default)
+        // Only sidecars in the listing are read, so photos without one don't each try to open a file.
+        let names = Set(contents.map { $0.lastPathComponent.lowercased() })
+        return zip(files, Sidecar.urls(for: files)).map { file, sidecar in
+            let settings = names.contains(sidecar.lastPathComponent.lowercased()) ? Sidecar.load(from: sidecar) : nil
+            return ScanEntry(url: file, sidecar: sidecar, settings: settings ?? .default)
         }
     }
 
@@ -573,16 +578,12 @@ final class LibraryModel {
     }
 
     private func didChangeSettings(of changed: [Photo]) {
-        for photo in changed {
-            scheduleSave(photo)
-            // The active photo's thumbnail comes from its preview, which isn't rendered while
-            // nothing is selected.
-            if photo === activePhoto {
-                requestPreview(forThumbnail: true)
-            } else {
-                enqueueThumbnails([photo])
-            }
-        }
+        changed.forEach(scheduleSave)
+        // The active photo's thumbnail comes from its preview, which isn't rendered while
+        // nothing is selected. The others are queued in one go, not one queue scan per photo.
+        let active = activePhoto
+        if let active, changed.contains(where: { $0 === active }) { requestPreview(forThumbnail: true) }
+        enqueueThumbnails(changed.filter { $0 !== active })
     }
 
     /// Resets `photos`, by default the selected photos.
@@ -815,9 +816,9 @@ final class LibraryModel {
         }
         // A photo being prefetched is shown when that's done, rather than decoded twice. With
         // other settings the render waits for the decode.
-        if let prefetching, prefetching.id == photo.id, prefetching.key == key { return }
-        let prefetch = prefetching.flatMap { $0.id == photo.id ? $0.task : nil }
-        post(PreviewRequest(photoID: photo.id, url: photo.url, key: key, sequence: previewSequence, showsResult: true, prefetch: prefetch))
+        let prefetch = prefetching.first { $0.id == photo.id }
+        if let prefetch, prefetch.key == key { return }
+        post(PreviewRequest(photoID: photo.id, url: photo.url, key: key, sequence: previewSequence, showsResult: true, prefetch: prefetch?.task))
     }
 
     private func post(_ request: PreviewRequest) {
@@ -913,56 +914,66 @@ final class LibraryModel {
         if previewCache.count > Self.previewCacheLimit { previewCache.removeFirst() }
     }
 
-    /// Photos worth rendering ahead of time: in the loupe the ones next to the active photo, the
-    /// one coming next first; in the grid the active photo, which Space or a double-click opens.
+    /// Photos worth rendering ahead of time: in the loupe as many as are prefetched at once in the
+    /// direction of the last step, then the one behind the active photo; in the grid the active
+    /// photo, which Space or a double-click opens.
     private var prefetchCandidates: [Photo] {
         guard let index = activeIndex, !isCropping else { return [] }
-        let indices = viewMode == .grid ? [index] : [index + stepDirection, index - stepDirection]
+        let ahead = (1...renderer.prefetchContexts.count).map { index + stepDirection * $0 }
+        let indices = viewMode == .grid ? [index] : ahead + [index - stepDirection]
         return indices.filter { photos.indices.contains($0) }.map { photos[$0] }
     }
 
-    /// The next photo to prefetch, once the active photo has been rendered.
+    /// The next photo to prefetch, once the active photo has been rendered and while a prefetch
+    /// context is free.
     private func nextPrefetch() -> Photo? {
-        guard !previewQueue.isRunning, detailTask == nil, !isSteppingQuickly else { return nil }
+        guard !previewQueue.isRunning, detailTask == nil, !isSteppingQuickly, prefetching.count < renderer.prefetchContexts.count
+        else { return nil }
         return prefetchCandidates.first { photo in
-            !prefetchFailures.contains(photo.id) && cachedPreview(for: photo, key: previewKey(for: photo)) == nil
+            !prefetchFailures.contains(photo.id) && !prefetching.contains { $0.id == photo.id }
+                && cachedPreview(for: photo, key: previewKey(for: photo)) == nil
         }
     }
 
-    /// Renders the photos the user is likely to look at next, one at a time, in the background.
-    /// Decoding a RAW file takes most of the time to open it, so after this the photo shows at once
-    /// and its first edit only waits for the GPU (about 0.15 s instead of 0.8 s for M11 files).
+    /// Renders the photos the user is likely to look at next in the background, as many at a time
+    /// as `PreviewRenderer.prefetchContexts` has. Decoding a RAW file takes most of the time to
+    /// open it, so after this the photo shows at once and its first edit only waits for the GPU
+    /// (about 0.15 s instead of 0.8 s for M11 files).
     private func schedulePrefetch() {
-        guard prefetchTask == nil, nextPrefetch() != nil else { return }
-        prefetchTask = Task {
-            while let photo = nextPrefetch() {
-                if viewMode == .grid {
-                    // Let the selection settle, so moving through the grid doesn't decode every photo.
-                    try? await Task.sleep(for: .milliseconds(300))
-                    guard nextPrefetch() === photo else { continue }
-                }
-                let key = previewKey(for: photo)
-                let renderer = renderer
-                let task = Task {
-                    await renderer.prefetch(url: photo.url, settings: key.settings, maxPixelSize: key.pixelSize, colorSpace: key.colorSpace)
-                }
-                prefetching = (photo.id, key, task)
-                let result = await task.value
-                prefetching = nil
-                // The folder may have changed meanwhile.
-                guard photosByID[photo.id] === photo else { continue }
-                if let result {
-                    storePreview(result, for: photo, key: key)
-                    noteSizes(of: photo, from: result)
-                    // Shown from the cache now, if it's the photo waiting for it.
-                    if photo.id == activeID { requestPreview() }
-                } else {
-                    prefetchFailures.insert(photo.id)
-                    if photo.id == activeID { requestPreview() }
-                }
+        guard prefetchDelay == nil else { return }
+        if viewMode == .grid {
+            // Let the selection settle, so moving through the grid doesn't decode every photo.
+            guard let photo = nextPrefetch() else { return }
+            prefetchDelay = Task {
+                try? await Task.sleep(for: .milliseconds(300))
+                prefetchDelay = nil
+                if nextPrefetch() === photo { prefetch(photo) } else { schedulePrefetch() }
             }
-            prefetchTask = nil
+            return
         }
+        while let photo = nextPrefetch() { prefetch(photo) }
+    }
+
+    private func prefetch(_ photo: Photo) {
+        let key = previewKey(for: photo)
+        let renderer = renderer
+        let task = Task {
+            let result = await renderer.prefetch(url: photo.url, settings: key.settings, maxPixelSize: key.pixelSize, colorSpace: key.colorSpace)
+            prefetching.removeAll { $0.id == photo.id }
+            defer { schedulePrefetch() }
+            // The folder may have changed meanwhile.
+            guard photosByID[photo.id] === photo else { return result }
+            if let result {
+                storePreview(result, for: photo, key: key)
+                noteSizes(of: photo, from: result)
+            } else {
+                prefetchFailures.insert(photo.id)
+            }
+            // Shown from the cache now, if it's the photo waiting for it.
+            if photo.id == activeID { requestPreview() }
+            return result
+        }
+        prefetching.append((photo.id, key, task))
     }
 
     /// Shows the camera's embedded preview of an unedited RAW photo until it has been rendered,
@@ -1335,9 +1346,9 @@ final class LibraryModel {
             while detailPending {
                 detailPending = false
                 guard let zoom, let photo = activePhoto, photo.id == zoom.photoID else { break }
-                if let prefetching, prefetching.id == photo.id {
+                if let prefetch = prefetching.first(where: { $0.id == photo.id }) {
                     // Already being decoded; wait for that rather than decoding it twice.
-                    _ = await prefetching.task.value
+                    _ = await prefetch.task.value
                 }
                 let original = showOriginal
                 let settings = original ? photo.settings.original : photo.settings
@@ -1430,8 +1441,8 @@ final class LibraryModel {
 
     private static let thumbnailBatch = 8
 
-    /// Loads thumbnails and metadata in parallel batches, then renders one at a time: a render
-    /// decodes the whole RAW, which doesn't get faster in parallel but uses much more memory.
+    /// Loads thumbnails and metadata in parallel batches, then renders as many at a time as
+    /// `Thumbnails.contexts` has.
     private func runThumbnailQueue() {
         guard thumbnailTask == nil, !thumbnailQueue.isEmpty || !renderQueue.isEmpty else { return }
         thumbnailTask = Task {
@@ -1445,13 +1456,30 @@ final class LibraryModel {
                         setThumbnail(await task.value, for: photo)
                     }
                 } else if !renderQueue.isEmpty {
-                    guard let photo = photosByID[renderQueue.removeFirst()] else { continue }
-                    setThumbnail(await loadThumbnail(for: photo).value, for: photo)
+                    await runRenders()
                 } else {
                     break
                 }
             }
             thumbnailTask = nil
+        }
+    }
+
+    /// Renders queued thumbnails, starting the next as each one finishes, until the queue is
+    /// empty or thumbnails are waiting to load: those go first, after the renders running.
+    private func runRenders() async {
+        await withTaskGroup(of: (id: Photo.ID, result: LoadedThumbnail).self) { group in
+            var running: [Photo.ID: Photo] = [:]
+            while true {
+                while running.count < Thumbnails.contexts.count, thumbnailQueue.isEmpty, !renderQueue.isEmpty {
+                    guard let photo = photosByID[renderQueue.removeFirst()] else { continue }
+                    let id = photo.id, task = loadThumbnail(for: photo)
+                    running[id] = photo
+                    group.addTask { (id, await task.value) }
+                }
+                guard let finished = await group.next() else { return }
+                if let photo = running.removeValue(forKey: finished.id) { setThumbnail(finished.result, for: photo) }
+            }
         }
     }
 

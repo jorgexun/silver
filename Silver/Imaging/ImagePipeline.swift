@@ -2,6 +2,7 @@ import CoreImage
 import CoreImage.CIFilterBuiltins
 import Foundation
 import ImageIO
+import Synchronization
 import UniformTypeIdentifiers
 
 /// A decoded source image. RAW files keep their `CIRAWFilter` so exposure and white balance
@@ -248,6 +249,35 @@ nonisolated enum ImagePipeline {
             bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue),
             provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent
         )
+    }
+}
+
+/// Low-priority contexts for background work that runs a few photos at once: prefetching,
+/// thumbnail renders and export. A context renders one image at a time, and most of an M11
+/// photo's render goes to decoding the RAW on one CPU core, so photos rendered at once each take
+/// their own context. Two threads sharing one context got almost nothing from the second.
+/// The contexts keep no intermediates (each photo is rendered once) and give way to the preview
+/// on the GPU.
+nonisolated final class ContextPool: @unchecked Sendable {
+    /// How many photos can render at once, each on its own context.
+    let count: Int
+    private let contexts: [CIContext]
+    private let free: Mutex<[Int]>
+
+    init(name: String, count: Int) {
+        self.count = count
+        contexts = (0..<count).map { _ in
+            CIContext(options: [.name: name, .cacheIntermediates: false, .priorityRequestLow: true])
+        }
+        free = Mutex(Array(0..<count))
+    }
+
+    /// Runs `body` with a context no other caller is using. Callers keep to `count` at once;
+    /// beyond that, extra callers share a context, which is safe but no faster.
+    func withContext<T>(_ body: (CIContext) throws -> T) rethrows -> T {
+        let index = free.withLock { $0.popLast() }
+        defer { if let index { free.withLock { $0.append(index) } } }
+        return try body(contexts[index ?? 0])
     }
 }
 
