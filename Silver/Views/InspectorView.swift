@@ -118,11 +118,10 @@ private struct GeometrySection: View {
         let settings = photo.settings
         InspectorSection("Crop") {
             HStack {
-                Text(summary(settings))
-                    .foregroundStyle(.secondary)
-                if settings.hasGeometry {
-                    ResetButton(title: "Crop") { library.resetActive(.geometry, actionName: "Reset Crop") }
+                ResettableLabel(text: summary(settings), name: "Crop", canReset: settings.hasGeometry) {
+                    library.resetActive(.geometry, actionName: "Reset Crop")
                 }
+                .foregroundStyle(.secondary)
                 Spacer()
                 Button("Crop") { library.beginCrop() }
                     .help("Crop & Straighten (R)")
@@ -158,23 +157,37 @@ struct InspectorSection<Content: View>: View {
     }
 }
 
-/// A small reset icon, shown after the name of something that has changed.
-private struct ResetButton: View {
-    let title: String
+/// The name of something that can be reset. While it has changed, hovering the name shows Reset
+/// in its place, and clicking it resets.
+private struct ResettableLabel: View {
+    let text: String
+    let name: String
+    let canReset: Bool
+    var help: String?
     let action: () -> Void
 
+    @State private var isHovering = false
+
     var body: some View {
-        Button("Reset \(title)", systemImage: "arrow.counterclockwise", action: action)
-            .labelStyle(.iconOnly)
-            .buttonStyle(.borderless)
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(.secondary)
-            .help("Reset \(title)")
+        let showsReset = canReset && isHovering
+        // Both strings take up space, so swapping them doesn't move the edge under the pointer.
+        ZStack(alignment: .leading) {
+            Text(text).opacity(showsReset ? 0 : 1)
+            Text("Reset").foregroundStyle(.white).opacity(showsReset ? 1 : 0)
+        }
+        .contentShape(Rectangle())
+        .onHover { isHovering = $0 }
+        .onTapGesture { if canReset { action() } }
+        .help(canReset ? "Reset \(name)" : help ?? "")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(text)
+        .accessibilityAction(named: "Reset \(name)") { if canReset { action() } }
     }
 }
 
-/// A named slider with its value, as in Lightroom: the icon after the name or double-clicking
-/// the slider resets it, and clicking the value lets you type one.
+/// A named slider with its value, as in Lightroom: hovering the name shows Reset in its place,
+/// double-clicking the slider also resets it, and clicking the value lets you type one. The name
+/// and value are dimmed until the pointer is over the slider or it's being dragged.
 struct AdjustmentSlider: View {
     let title: String
     @Binding var value: Double
@@ -187,25 +200,31 @@ struct AdjustmentSlider: View {
     let onCommit: (Double) -> Void
 
     @Environment(\.isEnabled) private var isEnabled
+    @State private var isHovering = false
+    @State private var isDragging = false
 
     var body: some View {
         VStack(spacing: 3) {
             HStack(alignment: .firstTextBaseline) {
-                Text(title)
-                    .help("Hold Option while dragging for finer control.")
-                if value != 0 {
-                    ResetButton(title: title, action: onReset)
-                }
+                ResettableLabel(text: title, name: title, canReset: value != 0,
+                                help: "Hold Option while dragging for finer control.", action: onReset)
                 Spacer(minLength: 0)
-                ValueField(text: format(value), isDefault: value == 0) { typed in
+                ValueField(text: format(value)) { typed in
                     onCommit(min(max(typed, range.lowerBound), range.upperBound))
                 }
             }
             .font(.callout)
+            .foregroundStyle(.white.opacity(isHovering || isDragging ? 1 : 0.7))
+            .animation(.easeOut(duration: 0.12), value: isHovering || isDragging)
             .opacity(isEnabled ? 1 : 0.4)
 
-            TrackSlider(value: $value, range: range, origin: 0, style: style, onEditingChanged: onEditingChanged, onReset: onReset)
+            TrackSlider(value: $value, range: range, origin: 0, style: style, onEditingChanged: { editing in
+                isDragging = editing
+                onEditingChanged(editing)
+            }, onReset: onReset)
         }
+        .contentShape(Rectangle())
+        .onHover { isHovering = $0 }
         // The value and the track react to taps and drags, which `disabled` alone doesn't stop.
         .allowsHitTesting(isEnabled)
     }
@@ -216,7 +235,6 @@ struct AdjustmentSlider: View {
 private struct ValueField: View {
     @Environment(LibraryModel.self) private var library
     let text: String
-    let isDefault: Bool
     let onCommit: (Double) -> Void
 
     /// The text being typed; nil when not editing.
@@ -247,7 +265,6 @@ private struct ValueField: View {
         } else {
             Text(text)
                 .monospacedDigit()
-                .foregroundStyle(isDefault ? .secondary : .primary)
                 .contentShape(Rectangle())
                 .onTapGesture(perform: begin)
                 .help("Click to type a value")
