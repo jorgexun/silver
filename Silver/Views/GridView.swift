@@ -25,6 +25,7 @@ struct GridView: View {
                         )
                         .frame(height: size)
                         .id(photo.id)
+                        .onAppear { library.prioritizeThumbnail(of: photo) }
                         .onTapGesture(count: 2) { library.open(photo) }
                         .simultaneousGesture(TapGesture().onEnded {
                             library.click(photo, modifiers: NSEvent.modifierFlags)

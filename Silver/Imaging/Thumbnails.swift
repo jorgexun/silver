@@ -28,12 +28,16 @@ nonisolated enum Thumbnails {
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
         ]
-        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary),
-              let context = CGContext(
-                  data: nil, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: 0, space: colorSpace,
-                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
-              )
-        else { return nil }
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary).flatMap { displayReady($0, colorSpace: colorSpace) }
+    }
+
+    /// `image` decoded into `colorSpace` and Core Animation's BGRA layout, so drawing it doesn't
+    /// convert every pixel on the main thread.
+    static func displayReady(_ image: CGImage, colorSpace: CGColorSpace) -> CGImage? {
+        guard let context = CGContext(
+            data: nil, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: 0, space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else { return nil }
         context.interpolationQuality = .none  // Same size: just color conversion.
         context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
         return context.makeImage()

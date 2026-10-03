@@ -6,6 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         library.restoreSession()
+        Task.detached(priority: .background) { ThumbnailCache.prune() }
         // Menu commands only see key presses; releasing a held \ ends a look at the original.
         keyUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyUp) { [library] event in
             if event.charactersIgnoringModifiers == "\\" { library.endOriginalPeek() }
