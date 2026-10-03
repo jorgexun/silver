@@ -54,20 +54,11 @@ private struct ExportPlan: View {
         let export = library.export
         let existing = export.existingCount(for: photos.map(\.url))
         if existing > 0, export.exportsToFolder, let folder = export.outputFolder {
-            let one = existing == 1
-            let found = one ? "1 photo already has a JPEG" : "\(existing) photos already have JPEGs"
-            let outcome = switch export.existingFilePolicy {
-            case .keepBoth: "A number is added to the new \(one ? "file’s name" : "files’ names")."
-            case .overwrite: one ? "It will be replaced." : "They will be replaced."
-            }
-            Label {
-                Text("\(found) in “\(folder.lastPathComponent)”. \(outcome)")
-            } icon: {
-                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
+            let found = existing == 1 ? "1 photo already has a JPEG" : "\(existing) photos already have JPEGs"
+            Text("\(found) in “\(folder.lastPathComponent)”.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }
