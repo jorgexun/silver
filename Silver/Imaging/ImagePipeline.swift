@@ -117,13 +117,11 @@ nonisolated final class SourceImage {
             // Before taking the output: computing coefficients changes the decode scale for a moment.
             let local = usesLocal ? localAdjustment(settings, context: context) : nil
             guard let output = raw.outputImage else { return nil }
-            image = ToneMapping.raw(output, exposure: settings.exposure, contrast: settings.contrast, local: local)
+            image = ToneMapping.raw(output, settings, local: local)
         } else {
             guard let bitmap = loadBitmap() else { return nil }
             let local = usesLocal ? localAdjustment(settings, context: context) : nil
-            image = ToneMapping.bitmap(
-                whiteBalanced(bitmap, settings), exposure: settings.exposure, contrast: settings.contrast, local: local
-            )
+            image = ToneMapping.bitmap(whiteBalanced(bitmap, settings), settings, local: local)
         }
         return ImagePipeline.applyColor(vibrance: settings.vibrance, saturation: settings.saturation, to: image)
     }

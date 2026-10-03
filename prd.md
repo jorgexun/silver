@@ -53,6 +53,8 @@
 - Contrast
 - Highlights
 - Shadows
+- Whites
+- Blacks
 - White Balance / Temperature
 - Tint
 - Saturation

@@ -43,6 +43,8 @@ private struct Adjustment {
         Adjustment(title: "Contrast", keyPath: \.contrast, range: -100...100),
         Adjustment(title: "Highlights", keyPath: \.highlights, range: -100...100),
         Adjustment(title: "Shadows", keyPath: \.shadows, range: -100...100),
+        Adjustment(title: "Whites", keyPath: \.whites, range: -100...100),
+        Adjustment(title: "Blacks", keyPath: \.blacks, range: -100...100),
     ]
 
     static let whiteBalance = [

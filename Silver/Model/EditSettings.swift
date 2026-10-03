@@ -8,6 +8,8 @@ nonisolated struct EditSettings: Equatable, Hashable, Sendable {
     var contrast: Double = 0      // -100...100
     var highlights: Double = 0    // -100...100
     var shadows: Double = 0       // -100...100
+    var whites: Double = 0        // -100...100
+    var blacks: Double = 0        // -100...100
 
     // Color
     var temperature: Double = 0   // -100...100, relative to as-shot white balance
@@ -40,6 +42,8 @@ nonisolated struct EditSettings: Equatable, Hashable, Sendable {
             result.contrast = source.contrast
             result.highlights = source.highlights
             result.shadows = source.shadows
+            result.whites = source.whites
+            result.blacks = source.blacks
         }
         if groups.contains(.whiteBalance) {
             result.temperature = source.temperature
@@ -60,7 +64,7 @@ nonisolated struct EditSettings: Equatable, Hashable, Sendable {
 
 extension EditSettings: Codable {
     private enum CodingKeys: String, CodingKey {
-        case version, exposure, contrast, highlights, shadows, temperature, tint, vibrance, saturation, crop, straighten, aspectRatio
+        case version, exposure, contrast, highlights, shadows, whites, blacks, temperature, tint, vibrance, saturation, crop, straighten, aspectRatio
     }
 
     static let currentVersion = 1
@@ -77,6 +81,8 @@ extension EditSettings: Codable {
         contrast = value(.contrast, in: -100...100)
         highlights = value(.highlights, in: -100...100)
         shadows = value(.shadows, in: -100...100)
+        whites = value(.whites, in: -100...100)
+        blacks = value(.blacks, in: -100...100)
         temperature = value(.temperature, in: -100...100)
         tint = value(.tint, in: -100...100)
         vibrance = value(.vibrance, in: -100...100)
@@ -94,6 +100,8 @@ extension EditSettings: Codable {
         try c.encode(contrast, forKey: .contrast)
         try c.encode(highlights, forKey: .highlights)
         try c.encode(shadows, forKey: .shadows)
+        try c.encode(whites, forKey: .whites)
+        try c.encode(blacks, forKey: .blacks)
         try c.encode(temperature, forKey: .temperature)
         try c.encode(tint, forKey: .tint)
         try c.encode(vibrance, forKey: .vibrance)

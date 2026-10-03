@@ -2,8 +2,8 @@ import CoreImage
 import Foundation
 import Synchronization
 
-/// Tone mapping: exposure, the base tone curve and Contrast, combined into one curve that
-/// `ToneKernels.metal` applies with Adobe's hue-preserving `RGBTone` method, after the local
+/// Tone mapping: exposure, the base tone curve, Contrast, Whites and Blacks, combined into one
+/// curve that `ToneKernels.metal` applies with Adobe's hue-preserving `RGBTone` method, after the local
 /// exposure change of Highlights and Shadows.
 ///
 /// The curves are evaluated on the CPU into lookup tables (images one pixel high), so any
@@ -97,12 +97,26 @@ nonisolated enum ToneMapping {
     private static let tables = Mutex<[(key: TableKey, table: CIImage)]>([])
     private static let tableCacheLimit = 32
 
-    private enum TableKey: Hashable {
-        case raw(exposure: Int, contrast: Int)
-        case bitmap(exposure: Int, contrast: Int)
+    /// The settings a table depends on, quantized so equal keys always produce equal tables.
+    private struct TableKey: Hashable {
+        let isRaw: Bool
+        let exposure: Int  // hundredths of a stop
+        let contrast: Int
+        let whites: Int
+        let blacks: Int
+
+        init(raw isRaw: Bool, _ settings: EditSettings) {
+            self.isRaw = isRaw
+            exposure = Int((clamp(settings.exposure, -5, 5) * 100).rounded())
+            contrast = Int(clamp(settings.contrast, -100, 100).rounded())
+            whites = Int(clamp(settings.whites, -100, 100).rounded())
+            blacks = Int(clamp(settings.blacks, -100, 100).rounded())
+        }
+
+        var exposureValue: Double { Double(exposure) / 100 }
     }
 
-    private static func table(for key: TableKey, _ f: () -> (Double) -> Double) -> CIImage {
+    private static func table(for key: TableKey) -> CIImage {
         let cached = tables.withLock { cache -> CIImage? in
             guard let index = cache.firstIndex(where: { $0.key == key }) else { return nil }
             let entry = cache.remove(at: index)
@@ -110,7 +124,7 @@ nonisolated enum ToneMapping {
             return entry.table
         }
         if let cached { return cached }
-        let table = makeTable(f())
+        let table = makeTable(key.isRaw ? rawCurve(key) : bitmapCurve(key))
         tables.withLock { cache in
             cache.append((key, table))
             if cache.count > tableCacheLimit { cache.removeFirst() }
@@ -129,14 +143,10 @@ nonisolated enum ToneMapping {
     // MARK: - RAW
 
     /// Develops scene-linear RAW output (white balance applied, highlight headroom kept) for display.
-    static func raw(_ image: CIImage, exposure: Double, contrast: Double, local: LocalAdjustment?) -> CIImage {
-        // Quantize to the cache key so equal keys always produce equal tables.
-        let exposureKey = Int((clamp(exposure, -5, 5) * 100).rounded())
-        let contrastKey = Int(clamp(contrast, -100, 100).rounded())
-        let table = table(for: .raw(exposure: exposureKey, contrast: contrastKey)) {
-            rawCurve(exposure: Double(exposureKey) / 100, contrast: Double(contrastKey))
-        }
-        return apply(table, to: image, exposure: Double(exposureKey) / 100, local: local)
+    static func raw(_ image: CIImage, _ settings: EditSettings, local: LocalAdjustment?) -> CIImage {
+        let key = TableKey(raw: true, settings)
+        let table = table(for: key)
+        return apply(table, to: image, exposure: key.exposureValue, local: local)
     }
 
     /// Scene value (at exposure 0) that becomes display white. Fixed rather than measured per image:
@@ -146,7 +156,8 @@ nonisolated enum ToneMapping {
     static let sceneWhite = 6.0
 
     /// Scene value → display value for RAW files.
-    private static func rawCurve(exposure: Double, contrast: Double) -> (Double) -> Double {
+    private static func rawCurve(_ key: TableKey) -> (Double) -> Double {
+        let exposure = key.exposureValue
         let white = sceneWhite
         let gain = pow(2, max(exposure, 0))
         // Positive exposure moves the white point up with the image; negative exposure keeps it,
@@ -156,7 +167,7 @@ nonisolated enum ToneMapping {
         let darken = NegativeExposure(exposure)
         return { x in
             let v = exposure < 0 ? white * darken(x / white) : x * gain
-            return applyContrast(base(v, white: top), contrast, pivot: midGray)
+            return finish(base(v, white: top), key, pivot: midGray)
         }
     }
 
@@ -192,19 +203,17 @@ nonisolated enum ToneMapping {
 
     // MARK: - JPEG
 
-    /// Exposure, Contrast, Highlights and Shadows for already-rendered images, which are treated
-    /// like scene values with white at 1. Returns the input unchanged when there is nothing to do.
-    static func bitmap(_ image: CIImage, exposure: Double, contrast: Double, local: LocalAdjustment?) -> CIImage {
-        let exposureKey = Int((clamp(exposure, -5, 5) * 100).rounded())
-        let contrastKey = Int(clamp(contrast, -100, 100).rounded())
-        guard exposureKey != 0 || contrastKey != 0 || local != nil else { return image }
-        let table = table(for: .bitmap(exposure: exposureKey, contrast: contrastKey)) {
-            bitmapCurve(exposure: Double(exposureKey) / 100, contrast: Double(contrastKey))
-        }
-        return apply(table, to: image, exposure: Double(exposureKey) / 100, local: local)
+    /// The light adjustments for already-rendered images, which are treated like scene values
+    /// with white at 1. Returns the input unchanged when there is nothing to do.
+    static func bitmap(_ image: CIImage, _ settings: EditSettings, local: LocalAdjustment?) -> CIImage {
+        let key = TableKey(raw: false, settings)
+        guard key != TableKey(raw: false, .default) || local != nil else { return image }
+        let table = table(for: key)
+        return apply(table, to: image, exposure: key.exposureValue, local: local)
     }
 
-    private static func bitmapCurve(exposure: Double, contrast: Double) -> (Double) -> Double {
+    private static func bitmapCurve(_ key: TableKey) -> (Double) -> Double {
+        let exposure = key.exposureValue
         let gain = pow(2, max(exposure, 0))
         let darken = NegativeExposure(exposure)
         let knee = 0.75
@@ -222,7 +231,7 @@ nonisolated enum ToneMapping {
             } else {
                 y = min(x * gain, 1)
             }
-            return applyContrast(y, contrast, pivot: 0.5)
+            return finish(y, key, pivot: 0.5)
         }
     }
 
@@ -247,17 +256,38 @@ nonisolated enum ToneMapping {
         }
     }
 
-    /// S-curve in gamma space around `pivot` (an sRGB-encoded value that stays put). The slope
-    /// at the pivot is `1 + 0.45 · contrast/100`; black and white stay fixed.
-    private static func applyContrast(_ y: Double, _ contrast: Double, pivot: Double) -> Double {
-        guard contrast != 0 else { return y }
+    /// Contrast, then Whites and Blacks, on a display value. Both work in gamma space; `pivot`
+    /// is the sRGB-encoded value Contrast keeps in place.
+    private static func finish(_ y: Double, _ key: TableKey, pivot: Double) -> Double {
+        guard key.contrast != 0 || key.whites != 0 || key.blacks != 0 else { return y }
+        let s = applyContrast(encode(y), Double(key.contrast), pivot: pivot)
+        return decode(applyEnds(s, whites: Double(key.whites), blacks: Double(key.blacks)))
+    }
+
+    /// S-curve on an sRGB-encoded value around `pivot`, which stays put. The slope at the pivot
+    /// is `1 + 0.45 · contrast/100`; black and white stay fixed.
+    private static func applyContrast(_ s: Double, _ contrast: Double, pivot: Double) -> Double {
+        guard contrast != 0 else { return s }
         let gamma = max(1 + 0.45 * contrast / 100, 0.3)
-        let s = encode(y)
-        let out = s < pivot
+        return s < pivot
             ? pivot * pow(s / pivot, gamma)
             : 1 - (1 - pivot) * pow((1 - s) / (1 - pivot), gamma)
-        return decode(out)
     }
+
+    /// Whites and Blacks move the ends of the curve, on an sRGB-encoded value. Whites +100 raises
+    /// white so that the top `endShift` clips, and −100 lowers it by as much; Blacks does the same
+    /// at black (−100 clips, +100 lifts black). Each fades out quadratically toward the middle of
+    /// the range, so midtones stay put. Slopes stay positive at any setting.
+    private static func applyEnds(_ s: Double, whites: Double, blacks: Double) -> Double {
+        let top = max(1 - (1 - s) / endReach, 0)
+        let bottom = max(1 - s / endReach, 0)
+        return s + endShift * (whites / 100 * top * top + blacks / 100 * bottom * bottom)
+    }
+
+    /// How far Whites and Blacks ±100 move white and black, in sRGB-encoded units.
+    private static let endShift = 0.15
+    /// How far from each end, in sRGB-encoded units, Whites and Blacks reach.
+    private static let endReach = 0.5
 
     private static func encode(_ y: Double) -> Double {
         let v = min(max(y, 0), 1)

@@ -74,6 +74,7 @@ Views can be checked the same way, without a display:
    - Scene white is 6.0, which covers the highlight headroom seen in M11 files; clipped areas render at 249–254. A per-image measured white point was tried and rejected: it cost about 0.12 s per photo opened or exported.
    - Positive exposure scales the image and white point together. Negative exposure uses Adobe's white-preserving curve.
    - Contrast is an S-curve in gamma space around mid-gray, folded into the same table.
+   - Whites and Blacks move the ends of the curve in gamma space, after Contrast, in the same table: ±100 moves white or black by 0.15 (sRGB-encoded), fading out quadratically by the middle of the range. Whites + and Blacks − clip, Whites − and Blacks + pull white down and lift black. Midtones move at most a few levels. At 0 the output is unchanged.
 3. Highlights and Shadows are local: before the curve, `rgbToneLocal` multiplies each pixel by 2^Δ, where Δ depends on an edge-aware local average of log2 luminance. Regions move as a whole, so detail keeps its contrast, and all channels get the same gain, so hue is kept. Design and measurements are in `research.md` appendix B.
    - The average is a self-guided filter (`LocalTone`) run at 512 px. The kernel samples its coefficients (a, b) bilinearly and combines them with full-resolution luminance (`a · L + b`), so it follows edges at full resolution. It maps coordinates itself: upscaling the coefficient image with a transform made Core Image render it at full size every time, about 45 ms per slider step at 100%.
    - The coefficients depend only on the photo and its white balance, not on exposure or the two sliders. `SourceImage` caches them per white balance. They are computed from a fixed 1024 px decode (the RAW filter's scale changes for a moment), so preview, thumbnails, 100% tiles and export get the same ones. Never compute them inside a tile render: their region of interest is the whole image.
@@ -82,7 +83,7 @@ Views can be checked the same way, without a display:
 4. `ImagePipeline.applyColor` handles vibrance and saturation.
 5. `applyGeometry` applies straighten, then crop, in Core Image's y-up coordinates.
 
-JPEG sources use `CITemperatureAndTint` for white balance and the same kernels with a display-referred table: exposure (with a shoulder that reaches white when raised) and Contrast, plus the same local Highlights and Shadows (coefficients from a 1024 px decode of the JPEG). With no adjustments they pass through untouched.
+JPEG sources use `CITemperatureAndTint` for white balance and the same kernels with a display-referred table: exposure (with a shoulder that reaches white when raised), Contrast, Whites and Blacks, plus the same local Highlights and Shadows (coefficients from a 1024 px decode of the JPEG). With no adjustments they pass through untouched.
 
 `research.md` surveys how Adobe, Apple, darktable and RawTherapee design these curves, with measurements.
 
