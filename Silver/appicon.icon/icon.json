@@ -1,18 +1,22 @@
 {
   "fill" : {
     "linear-gradient" : [
-      "display-p3:0.96783,0.96514,0.96520,1.00000",
-      "display-p3:0.00000,0.00000,0.00000,1.00000"
+      "display-p3:0.30381,0.29892,0.29619,1.00000",
+      "display-p3:0.07113,0.07113,0.07113,1.00000"
     ]
   },
   "groups" : [
     {
+      "blur-material" : null,
+      "hidden" : false,
       "layers" : [
         {
-          "image-name" : "ChatGPT Image Oct 2, 2026, 02_34_38 PM.png",
-          "name" : "ChatGPT Image Oct 2, 2026, 02_34_38 PM",
+          "glass" : false,
+          "hidden" : false,
+          "image-name" : "silver_logo.png",
+          "name" : "silver_logo",
           "position" : {
-            "scale" : 0.62,
+            "scale" : 0.66,
             "translation-in-points" : [
               0,
               0
@@ -20,8 +24,14 @@
           }
         }
       ],
+      "lighting" : "individual",
+      "refractivity" : {
+        "depth" : 0,
+        "enabled" : false,
+        "strength" : 0.5
+      },
       "shadow" : {
-        "kind" : "neutral",
+        "kind" : "none",
         "opacity" : 0.5
       },
       "translucency" : {
