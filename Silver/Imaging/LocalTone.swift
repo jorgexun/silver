@@ -1,7 +1,7 @@
 import CoreImage
 import Foundation
 
-/// The edge-aware local average that Highlights and Shadows act on (see research.md appendix B).
+/// The edge-aware local average that Highlights and Shadows act on.
 ///
 /// A self-guided filter on log2 luminance, computed at low resolution: its coefficients (a, b)
 /// are scaled up to the image, where `a · L + b` with the full-resolution luminance L gives an
