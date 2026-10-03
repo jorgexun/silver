@@ -49,7 +49,7 @@ struct TrackSlider: View {
     }
 
     private static let knobSize: CGFloat = 12
-    private static let trackHeight: CGFloat = 4
+    private static let trackHeight: CGFloat = 3
 
     var body: some View {
         GeometryReader { geometry in
@@ -125,7 +125,7 @@ struct TrackSlider: View {
             if origin > range.lowerBound, origin < range.upperBound {
                 let x = scale.x(origin)
                 context.fill(
-                    Path(roundedRect: CGRect(x: x - 0.75, y: bar.midY - 5, width: 1.5, height: 10), cornerRadius: 0.75),
+                    Path(roundedRect: CGRect(x: x - 0.75, y: bar.midY - 3.5, width: 1.5, height: 7), cornerRadius: 0.75),
                     with: .color(.white.opacity(0.4))
                 )
             }
