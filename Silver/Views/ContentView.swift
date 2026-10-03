@@ -11,7 +11,11 @@ struct ContentView: View {
             SidebarView()
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 360)
         } detail: {
-            content
+            // In a container that stays when `content` switches views: on the switch itself, the
+            // window lays out the toolbar again, about 0.1 s each time a folder opens.
+            ZStack { content }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.canvas)
                 .toolbar { toolbar }
         }
         // On the split view, not the detail, so the inspector is a column with its own part of
@@ -64,24 +68,16 @@ struct ContentView: View {
                 Button("Add Folder…") { library.presentAddFolderPanel() }
                     .buttonStyle(.borderedProminent)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color.canvas)
         } else if library.folderURL == nil {
             ContentUnavailableView("Select a Folder", systemImage: "sidebar.leading", description: Text("Choose a folder in the sidebar."))
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color.canvas)
         } else if library.isScanning {
-            ProgressView("Loading Photos…")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color.canvas)
+            ScanningView()
         } else if library.photos.isEmpty {
             ContentUnavailableView {
                 Label("No Photos", systemImage: "photo.on.rectangle")
             } description: {
                 Text("This folder doesn’t contain any DNG or JPEG files. Photos in subfolders are shown when you select the subfolder.")
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color.canvas)
         } else {
             switch library.viewMode {
             case .grid: GridView()
@@ -158,6 +154,21 @@ struct ContentView: View {
             }
             .help("Show or Hide Adjustments (⌥⌘I)")
         }
+    }
+}
+
+/// Shown while a folder is listed. That usually takes a few frames, so the progress only appears
+/// when it takes longer, instead of flashing before the grid.
+private struct ScanningView: View {
+    @State private var showsProgress = false
+
+    var body: some View {
+        ProgressView("Loading Photos…")
+            .opacity(showsProgress ? 1 : 0)
+            .task {
+                try? await Task.sleep(for: .seconds(0.5))
+                showsProgress = true
+            }
     }
 }
 

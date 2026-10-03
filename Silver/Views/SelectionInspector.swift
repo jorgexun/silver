@@ -109,7 +109,7 @@ private struct SelectedPhotoRow: View {
                         .interpolation(.high)
                         .aspectRatio(contentMode: .fit)
                 } else {
-                    Color.white.opacity(0.05)
+                    Color.imagePlaceholder
                 }
             }
             .frame(width: Self.thumbnailSize, height: Self.thumbnailSize)

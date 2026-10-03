@@ -95,7 +95,11 @@ struct ThumbnailCell: View {
                     }
                     .padding(10)
             } else {
-                ProgressView().controlSize(.small)
+                // A quiet stand-in at the usual 3:2, not a spinner in every cell.
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(Color.imagePlaceholder)
+                    .aspectRatio(1.5, contentMode: .fit)
+                    .padding(10)
             }
         }
         .selectionRing(isSelected, isActive: isActive, cornerRadius: 8)
@@ -190,7 +194,7 @@ private struct FilmstripCell: View {
                     .interpolation(.high)
                     .aspectRatio(contentMode: .fill)
             } else {
-                Color.white.opacity(0.05)
+                Color.imagePlaceholder
             }
         }
         .frame(width: width, height: Self.imageHeight)

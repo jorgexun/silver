@@ -16,7 +16,10 @@ final class Photo: Identifiable {
     /// Stored rather than derived from `settings`, so views and menus that only show whether a
     /// photo is edited aren't updated on every step of a slider drag.
     private(set) var isEdited: Bool
-    var thumbnail: CGImage?
+    private(set) var thumbnail: CGImage?
+    /// The settings `thumbnail` shows. It differs from `settings` while a newer one is being made.
+    private(set) var thumbnailSettings: EditSettings?
+    var hasCurrentThumbnail: Bool { thumbnailSettings == settings }
     var metadata: PhotoMetadata?
     /// Oriented size of the developed image, used for crop geometry.
     var imageSize: CGSize?
@@ -44,6 +47,11 @@ final class Photo: Identifiable {
     /// file's size through the crop.
     var exportSize: CGSize? {
         fullSize ?? metadata?.pixelSize.map { ImagePipeline.outputSize(settings, imageSize: $0) }
+    }
+
+    func showThumbnail(_ image: CGImage, settings: EditSettings) {
+        thumbnail = image
+        thumbnailSettings = settings
     }
 
     private func updateFullSize() {

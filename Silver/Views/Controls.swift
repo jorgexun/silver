@@ -3,6 +3,8 @@ import SwiftUI
 extension Color {
     /// Neutral background behind photos.
     static let canvas = Color(white: 0.11)
+    /// Stands in for a thumbnail or photo that hasn't loaded yet.
+    static let imagePlaceholder = Color.white.opacity(0.05)
     /// Outline of selected thumbnails. Lighter than the accent color (a mid gray, so the white
     /// text on sidebar highlights and buttons stays readable).
     static let selectionRing = Color(white: 0.68)

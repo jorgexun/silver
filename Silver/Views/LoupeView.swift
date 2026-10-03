@@ -1023,7 +1023,7 @@ struct CropEditorView: View {
                         .resizable()
                         .interpolation(.high)
                 } else {
-                    Rectangle().fill(Color.white.opacity(0.05))
+                    Color.imagePlaceholder
                         .overlay { ProgressView().controlSize(.small) }
                 }
             }

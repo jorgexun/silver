@@ -198,7 +198,10 @@ final class LibraryModel {
 
     // MARK: Background work
 
+    /// Photos waiting for a cached or embedded thumbnail, or for metadata.
     private var thumbnailQueue: [Photo.ID] = []
+    /// Edited photos waiting for a rendered thumbnail, done after `thumbnailQueue`.
+    private var renderQueue: [Photo.ID] = []
     private var thumbnailTask: Task<Void, Never>?
     private var dirtyIDs: Set<Photo.ID> = []
     private var saveTask: Task<Void, Never>?
@@ -324,18 +327,24 @@ final class LibraryModel {
         viewMode = keepState ? viewMode : .grid
 
         Task {
-            let entries = await Task.detached(priority: .userInitiated) { Self.scan(url) }.value
+            let (entries, cached) = await Task.detached(priority: .userInitiated) {
+                let entries = Self.scan(url)
+                let start = previousActiveID.flatMap { id in entries.firstIndex { $0.url == id } } ?? 0
+                return (entries, Self.cachedThumbnails(of: entries, around: start))
+            }.value
             guard folderURL == url else { return }
             await renderer.removeAll()
             photos = entries.map { Photo(url: $0.url, sidecarURL: $0.sidecar, settings: $0.settings) }
             photosByID = Dictionary(uniqueKeysWithValues: photos.map { ($0.id, $0) })
+            for (id, entry) in cached { photosByID[id]?.showThumbnail(entry.image, settings: entry.settings) }
             isScanning = false
 
             // A folder opens with nothing selected, as in Finder; reloading keeps the active photo.
             if let photo = previousActiveID.flatMap({ photosByID[$0] }) ?? photos.first {
                 if keepsSelection { select(photo) } else { setActive(photo.id) }
             }
-            // Embedded previews first; edited photos are re-queued for a rendered thumbnail.
+            // Embedded previews, and metadata for photos shown from the cache; edited photos
+            // without a current thumbnail are rendered after those.
             enqueueThumbnails(photos)
         }
     }
@@ -362,6 +371,7 @@ final class LibraryModel {
         undoStack = []
         redoStack = []
         thumbnailQueue = []
+        renderQueue = []
     }
 
     nonisolated private struct ScanEntry: Sendable {
@@ -373,7 +383,8 @@ final class LibraryModel {
     nonisolated private static func scan(_ folder: URL) -> [ScanEntry] {
         let contents = (try? FileManager.default.contentsOfDirectory(
             at: folder,
-            includingPropertiesForKeys: [.isRegularFileKey],
+            // The thumbnail cache's key, fetched with the listing.
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey],
             options: [.skipsHiddenFiles]
         )) ?? []
         let files = contents
@@ -1392,47 +1403,81 @@ final class LibraryModel {
 
     // MARK: - Thumbnails
 
+    /// Whether a photo's thumbnail is rendered rather than loaded: an edited photo that shows a
+    /// stand-in. Photos without a thumbnail get a cached or embedded one first.
+    private static func needsRender(_ photo: Photo) -> Bool {
+        photo.isEdited && photo.thumbnail != nil && !photo.hasCurrentThumbnail
+    }
+
     private func enqueueThumbnails(_ list: [Photo], atFront: Bool = false) {
-        let ids = list.map(\.id).filter { !thumbnailQueue.contains($0) }
-        if atFront {
-            thumbnailQueue.insert(contentsOf: ids, at: 0)
-        } else {
-            thumbnailQueue.append(contentsOf: ids)
+        let queued = Set(thumbnailQueue).union(renderQueue)
+        let (renders, loads) = list.filter { !queued.contains($0.id) }.reduce(into: ([Photo.ID](), [Photo.ID]())) { lists, photo in
+            if Self.needsRender(photo) { lists.0.append(photo.id) } else { lists.1.append(photo.id) }
         }
+        thumbnailQueue.insert(contentsOf: loads, at: atFront ? 0 : thumbnailQueue.endIndex)
+        renderQueue.insert(contentsOf: renders, at: atFront ? 0 : renderQueue.endIndex)
         runThumbnailQueue()
     }
 
     /// Moves a photo that has come into view ahead of those still waiting.
     func prioritizeThumbnail(of photo: Photo) {
-        guard let index = thumbnailQueue.firstIndex(of: photo.id), index > 0 else { return }
-        thumbnailQueue.remove(at: index)
-        thumbnailQueue.insert(photo.id, at: 0)
+        if let index = thumbnailQueue.firstIndex(of: photo.id) {
+            thumbnailQueue.insert(thumbnailQueue.remove(at: index), at: 0)
+        } else if let index = renderQueue.firstIndex(of: photo.id) {
+            renderQueue.insert(renderQueue.remove(at: index), at: 0)
+        }
     }
 
     private static let thumbnailBatch = 8
 
+    /// Loads thumbnails and metadata in parallel batches, then renders one at a time: a render
+    /// decodes the whole RAW, which doesn't get faster in parallel but uses much more memory.
     private func runThumbnailQueue() {
-        guard thumbnailTask == nil, !thumbnailQueue.isEmpty else { return }
+        guard thumbnailTask == nil, !thumbnailQueue.isEmpty || !renderQueue.isEmpty else { return }
         thumbnailTask = Task {
-            while !thumbnailQueue.isEmpty {
-                let batch = thumbnailQueue.prefix(Self.thumbnailBatch).compactMap { photosByID[$0] }
-                thumbnailQueue.removeFirst(min(Self.thumbnailBatch, thumbnailQueue.count))
-
-                // Photos without a thumbnail get the cached or embedded one first. These load in
-                // parallel. Rendered ones decode the whole RAW, which doesn't get faster in
-                // parallel but uses much more memory, so they run one at a time.
-                let (renders, quick) = batch.reduce(into: ([Photo](), [Photo]())) { lists, photo in
-                    if photo.isEdited && photo.thumbnail != nil { lists.0.append(photo) } else { lists.1.append(photo) }
-                }
-                for (photo, task) in quick.map({ ($0, loadThumbnail(for: $0, render: false)) }) {
-                    setThumbnail(await task.value, for: photo)
-                }
-                for photo in renders {
-                    setThumbnail(await loadThumbnail(for: photo, render: true).value, for: photo)
+            while true {
+                if !thumbnailQueue.isEmpty {
+                    let batch = thumbnailQueue.prefix(Self.thumbnailBatch).compactMap { photosByID[$0] }
+                    thumbnailQueue.removeFirst(min(Self.thumbnailBatch, thumbnailQueue.count))
+                    // A photo edited while it waited may need a render now.
+                    enqueueThumbnails(batch.filter(Self.needsRender))
+                    for (photo, task) in batch.filter({ !Self.needsRender($0) }).map({ ($0, loadThumbnail(for: $0)) }) {
+                        setThumbnail(await task.value, for: photo)
+                    }
+                } else if !renderQueue.isEmpty {
+                    guard let photo = photosByID[renderQueue.removeFirst()] else { continue }
+                    setThumbnail(await loadThumbnail(for: photo).value, for: photo)
+                } else {
+                    break
                 }
             }
             thumbnailTask = nil
         }
+    }
+
+    /// How many cached thumbnails a folder loads before it shows: more than fit a large window
+    /// at the smallest size. Reading one takes about 1 ms, so the grid shows them at once
+    /// instead of filling in.
+    private static let preloadedThumbnails = 200
+
+    /// Cached thumbnails of the photos around `start`. They load in parallel.
+    nonisolated private static func cachedThumbnails(of entries: [ScanEntry], around start: Int) -> [Photo.ID: ThumbnailCache.Entry] {
+        let lower = max(start - preloadedThumbnails / 2, 0)
+        let range = lower..<min(lower + preloadedThumbnails, entries.count)
+        let results = Mutex<[Photo.ID: ThumbnailCache.Entry]>([:])
+        DispatchQueue.concurrentPerform(iterations: range.count) { offset in
+            let entry = entries[range.lowerBound + offset]
+            guard let cached = cachedThumbnail(url: entry.url, settings: entry.settings) else { return }
+            results.withLock { $0[entry.url] = cached }
+        }
+        return results.withLock { $0 }
+    }
+
+    /// The cached thumbnail, if it has `settings`, or for an edited photo an older render: that's
+    /// closer than the camera's preview until the new one is done.
+    nonisolated private static func cachedThumbnail(url: URL, settings: EditSettings) -> ThumbnailCache.Entry? {
+        guard let cached = ThumbnailCache.load(for: url), cached.settings == settings || !settings.isDefault else { return nil }
+        return cached
     }
 
     nonisolated private struct LoadedThumbnail: Sendable {
@@ -1443,26 +1488,24 @@ final class LibraryModel {
         var metadata: PhotoMetadata?
     }
 
-    /// Loads metadata if missing, and either a render with the photo's settings, or its cached
-    /// thumbnail, or else the file's embedded preview.
-    private func loadThumbnail(for photo: Photo, render: Bool) -> Task<LoadedThumbnail, Never> {
+    /// Loads metadata if missing, and unless the thumbnail is current, either a render with the
+    /// photo's settings (see `needsRender`), or its cached thumbnail, or else the file's embedded preview.
+    private func loadThumbnail(for photo: Photo) -> Task<LoadedThumbnail, Never> {
         let url = photo.url
         let needsMetadata = photo.metadata == nil
+        let needsImage = !photo.hasCurrentThumbnail
+        let render = Self.needsRender(photo)
         let settings = photo.settings
         return Task.detached(priority: .utility) {
-            var result = LoadedThumbnail(metadata: needsMetadata ? PhotoMetadata.load(url: url) : nil)
+            let metadata = needsMetadata ? PhotoMetadata.load(url: url) : nil
+            guard needsImage else { return LoadedThumbnail(metadata: metadata) }
             if render {
-                result.image = Thumbnails.rendered(url: url, settings: settings)
-                result.settings = settings
-            } else if let cached = ThumbnailCache.load(for: url), cached.settings == settings || !settings.isDefault {
-                // An older render is closer than the camera's preview until the new one is done.
-                result.image = cached.image
-                result.settings = cached.settings
-                result.isCached = true
-            } else {
-                result.image = Thumbnails.embedded(url: url)
+                return LoadedThumbnail(image: Thumbnails.rendered(url: url, settings: settings), settings: settings, metadata: metadata)
             }
-            return result
+            if let cached = Self.cachedThumbnail(url: url, settings: settings) {
+                return LoadedThumbnail(image: cached.image, settings: cached.settings, isCached: true, metadata: metadata)
+            }
+            return LoadedThumbnail(image: Thumbnails.embedded(url: url), metadata: metadata)
         }
     }
 
@@ -1474,14 +1517,14 @@ final class LibraryModel {
         } else if photo.thumbnail == nil {
             // Stands in until a thumbnail with the photo's settings is done. A stale one for a photo
             // that has a thumbnail is dropped: a newer request is already queued.
-            photo.thumbnail = image
+            photo.showThumbnail(image, settings: result.settings)
             enqueueThumbnails([photo])
         }
     }
 
     /// Shows a thumbnail that has the photo's settings, and caches it for the next time the folder opens.
     private func acceptThumbnail(_ image: CGImage, settings: EditSettings, for photo: Photo, store: Bool = true) {
-        photo.thumbnail = image
+        photo.showThumbnail(image, settings: settings)
         guard store else { return }
         let url = photo.url
         Task.detached(priority: .utility) { ThumbnailCache.store(image, settings: settings, for: url) }
