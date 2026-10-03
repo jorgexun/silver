@@ -88,6 +88,11 @@ struct SilverCommands: Commands {
                 Button("Show in Finder") { library.revealActiveInFinder() }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
                     .disabled(targets == 0)
+                Divider()
+                // No confirmation, as in Lightroom: Finder's Put Back restores the photos.
+                Button(targets > 1 ? "Move \(targets) Photos to Trash" : "Move to Trash") { library.moveToTrash() }
+                    .keyboardShortcut(.delete, modifiers: [])
+                    .disabled(targets == 0 || library.isCropping || !singleKeys)
             }
             .disabled(noWindow)
         }

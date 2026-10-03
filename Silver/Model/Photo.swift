@@ -5,7 +5,8 @@ import Observation
 @Observable
 final class Photo: Identifiable {
     let url: URL
-    let sidecarURL: URL
+    /// Changes when a JPG's RAW comes back into the folder and takes the short name.
+    var sidecarURL: URL
     var settings: EditSettings {
         didSet {
             let edited = !settings.isDefault

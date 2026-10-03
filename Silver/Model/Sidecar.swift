@@ -6,16 +6,18 @@ nonisolated enum Sidecar {
 
     /// The sidecar of each photo in a folder, in the same order: `L1001234.DNG` → `L1001234.edit.json`.
     /// When a DNG and a JPG share a base name (RAW+JPG shooting), the DNG keeps the short
-    /// name and the other file uses `L1001234.JPG.edit.json`.
-    static func urls(for folderFiles: [URL]) -> [URL] {
+    /// name and the other file uses `L1001234.JPG.edit.json`. A long name in `existing` (the folder's
+    /// file names, lowercased) is kept, so a JPG keeps its edits while its DNG is in the Trash.
+    static func urls(for folderFiles: [URL], existing: Set<String>) -> [URL] {
         // Grouped by base name: comparing every photo with every other took 4.4 s for 2,000 photos.
         let groups = Dictionary(grouping: folderFiles) { $0.deletingPathExtension().lastPathComponent.lowercased() }
         return folderFiles.map { photoURL in
             let base = photoURL.deletingPathExtension().lastPathComponent
             let siblings = groups[base.lowercased(), default: []].filter { $0 != photoURL }
-            let ownsShortName = siblings.isEmpty || (PhotoFile.isRaw(photoURL) && !siblings.contains(where: { PhotoFile.isRaw($0) }))
-            let name = ownsShortName ? base + suffix : photoURL.lastPathComponent + suffix
-            return photoURL.deletingLastPathComponent().appendingPathComponent(name)
+            let longName = photoURL.lastPathComponent + suffix
+            let ownsShortName = !existing.contains(longName.lowercased())
+                && (siblings.isEmpty || (PhotoFile.isRaw(photoURL) && !siblings.contains(where: { PhotoFile.isRaw($0) })))
+            return photoURL.deletingLastPathComponent().appendingPathComponent(ownsShortName ? base + suffix : longName)
         }
     }
 

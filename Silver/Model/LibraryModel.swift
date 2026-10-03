@@ -283,7 +283,7 @@ final class LibraryModel {
     private var volumeObservers: [NSObjectProtocol] = []
 
     /// Folders on external drives come and go; re-check them when volumes change or the app
-    /// becomes active.
+    /// becomes active. Each also picks up photos added or removed in Finder meanwhile.
     private func observeVolumes() {
         let workspace = NSWorkspace.shared.notificationCenter
         // Delivered on the main queue; the model lives for the whole app session.
@@ -298,11 +298,13 @@ final class LibraryModel {
     }
 
     private func volumesChanged() {
-        guard folders.refreshAvailability() else { return }
-        if let folderURL, folders.root(containing: folderURL)?.isAvailable != true {
-            closeFolder(forget: false)  // Reopened when the drive comes back.
+        if folders.refreshAvailability() {
+            if let folderURL, folders.root(containing: folderURL)?.isAvailable != true {
+                closeFolder(forget: false)  // Reopened when the drive comes back.
+            }
+            if folderURL == nil { openSavedFolder() }
         }
-        if folderURL == nil { openSavedFolder() }
+        syncFolder()
     }
 
     private static let selectedFolderKey = "SelectedFolderPath"
@@ -377,6 +379,43 @@ final class LibraryModel {
         renderQueue = []
     }
 
+    /// Picks up photos added to or removed from the folder outside Silver, e.g. put back from the
+    /// Trash in Finder. Unlike `reloadFolder()`, it keeps decoded photos, previews and undo. The
+    /// folder is listed off the main actor, and only new photos' sidecars are read.
+    private func syncFolder() {
+        guard let url = folderURL, !isScanning else { return }
+        let known = Set(photos.map(\.id))
+        Task {
+            let entries = await Task.detached(priority: .utility) { () -> [ScanEntry]? in
+                guard let contents = Self.list(url), Set(contents.filter { PhotoFile.isSupported($0) }) != known else { return nil }
+                return Self.entries(from: contents, readingSidecarsExcept: known)
+            }.value
+            guard let entries, folderURL == url, !isScanning else { return }
+            applyListing(entries)
+        }
+    }
+
+    private func applyListing(_ entries: [ScanEntry]) {
+        let listed = Set(entries.map(\.url))
+        remove(photos.filter { !listed.contains($0.id) })
+        // A photo trashed in Silver while the folder was listed stays out.
+        let added = entries
+            .filter { photosByID[$0.url] == nil && FileManager.default.fileExists(atPath: $0.url.path) }
+            .map { Photo(url: $0.url, sidecarURL: $0.sidecar, settings: $0.settings) }
+        guard !added.isEmpty else { return }
+        for photo in added { photosByID[photo.id] = photo }
+        photos = entries.compactMap { photosByID[$0.url] }
+        // A JPG whose RAW is back gives it the short sidecar name. Its settings are written to the
+        // long name.
+        for entry in entries {
+            guard let photo = photosByID[entry.url], photo.sidecarURL != entry.sidecar else { continue }
+            photo.sidecarURL = entry.sidecar
+            scheduleSave(photo)
+        }
+        if activeID == nil, let first = photos.first { setActive(first.id) }
+        enqueueThumbnails(added)
+    }
+
     nonisolated private struct ScanEntry: Sendable {
         let url: URL
         let sidecar: URL
@@ -384,20 +423,25 @@ final class LibraryModel {
     }
 
     nonisolated private static func scan(_ folder: URL) -> [ScanEntry] {
-        let contents = (try? FileManager.default.contentsOfDirectory(
-            at: folder,
-            // The thumbnail cache's key, fetched with the listing.
-            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        )) ?? []
+        // The thumbnail cache's key, fetched with the listing.
+        entries(from: list(folder, prefetching: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]) ?? [])
+    }
+
+    nonisolated private static func list(_ folder: URL, prefetching keys: [URLResourceKey]? = nil) -> [URL]? {
+        try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])
+    }
+
+    /// The photos in a folder's listing, sorted by name, with their sidecars. Settings of photos in
+    /// `known` aren't read and stay at default.
+    nonisolated private static func entries(from contents: [URL], readingSidecarsExcept known: Set<Photo.ID> = []) -> [ScanEntry] {
         let files = contents
             .filter { PhotoFile.isSupported($0) }
             .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
         // Only sidecars in the listing are read, so photos without one don't each try to open a file.
         let names = Set(contents.map { $0.lastPathComponent.lowercased() })
-        return zip(files, Sidecar.urls(for: files)).map { file, sidecar in
-            let settings = names.contains(sidecar.lastPathComponent.lowercased()) ? Sidecar.load(from: sidecar) : nil
-            return ScanEntry(url: file, sidecar: sidecar, settings: settings ?? .default)
+        return zip(files, Sidecar.urls(for: files, existing: names)).map { file, sidecar in
+            let reads = !known.contains(file) && names.contains(sidecar.lastPathComponent.lowercased())
+            return ScanEntry(url: file, sidecar: sidecar, settings: (reads ? Sidecar.load(from: sidecar) : nil) ?? .default)
         }
     }
 
@@ -1603,6 +1647,73 @@ final class LibraryModel {
         let urls = targetPhotos.map(\.url)
         guard !urls.isEmpty else { return }
         NSWorkspace.shared.activateFileViewerSelecting(urls)
+    }
+
+    // MARK: - Trash
+
+    /// Moves `photos`, by default the selected photos, to the Trash with their sidecars, without
+    /// asking: Finder's Put Back restores them.
+    func moveToTrash(_ photos: [Photo]? = nil) {
+        let targets = photos ?? targetPhotos
+        guard !targets.isEmpty else { return }
+        endCrop()
+        // A photo put back from the Trash keeps its latest edits.
+        flushSaves()
+        var trashed: [Photo] = []
+        var failure: String?
+        for photo in targets {
+            do {
+                try FileManager.default.trashItem(at: photo.url, resultingItemURL: nil)
+            } catch {
+                failure = failure ?? "Could not move \(photo.name) to the Trash: \(error.localizedDescription)"
+                continue
+            }
+            trashed.append(photo)
+            // Unedited photos have none.
+            try? FileManager.default.trashItem(at: photo.sidecarURL, resultingItemURL: nil)
+        }
+        if let failure { alertMessage = failure }
+        remove(trashed)
+    }
+
+    /// Takes photos out of the folder shown. If the active photo goes, the photo after it takes
+    /// its place, as in Lightroom. Queues and caches skip photos no longer in `photosByID`.
+    private func remove(_ removed: [Photo]) {
+        let ids = Set(removed.map(\.id))
+        guard let firstIndex = photos.firstIndex(where: { ids.contains($0.id) }) else { return }
+        let removesActive = activeID.map(ids.contains) ?? false
+        let hadSelection = !selection.isEmpty
+        photos.removeAll { ids.contains($0.id) }
+        for id in ids {
+            photosByID[id] = nil
+            thumbnailRefreshes.removeValue(forKey: id)?.cancel()
+        }
+        selection.subtract(ids)
+        prefetchFailures.subtract(ids)
+        undoStack = Self.records(undoStack, without: ids)
+        redoStack = Self.records(redoStack, without: ids)
+
+        guard removesActive else { return }
+        guard !photos.isEmpty else {
+            viewMode = .grid
+            resetFolderState()
+            return
+        }
+        let next = photos[min(firstIndex, photos.count - 1)]
+        if viewMode == .loupe || (hadSelection && selection.isEmpty) {
+            select(next)
+        } else {
+            setActive(selectedPhotos.first?.id ?? next.id)
+        }
+    }
+
+    /// Undo records without the changes to removed photos; records left empty are dropped.
+    private static func records(_ records: [EditRecord], without ids: Set<Photo.ID>) -> [EditRecord] {
+        records.compactMap { record in
+            guard record.changes.contains(where: { ids.contains($0.id) }) else { return record }
+            let changes = record.changes.filter { !ids.contains($0.id) }
+            return changes.isEmpty ? nil : EditRecord(name: record.name, changes: changes)
+        }
     }
 }
 

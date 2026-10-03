@@ -132,6 +132,9 @@ struct PhotoContextMenu: View {
         Button("Show in Finder") {
             NSWorkspace.shared.activateFileViewerSelecting(targets.map(\.url))
         }
+        Divider()
+        Button(count > 1 ? "Move \(count) Photos to Trash" : "Move to Trash") { library.moveToTrash(targets) }
+            .disabled(library.isCropping)
     }
 }
 
