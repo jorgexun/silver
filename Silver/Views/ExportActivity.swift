@@ -1,26 +1,39 @@
 import SwiftUI
 
-/// The toolbar item for a background export: the system spinner while it runs, its spokes
-/// lighting up as photos are done, then how it went.
-/// Clicking it shows the details. `ExportModel` decides when the result goes away.
-struct ExportActivityButton: View {
+/// The toolbar's Export button. While an export runs it shows the progress instead: the system
+/// spinner until the first photo is done, then a ring that closes as photos are done, then how
+/// it went, until `ExportModel` dismisses the result. Clicking it meanwhile shows the details;
+/// more photos can still be exported from the menus.
+struct ExportButton: View {
     @Environment(LibraryModel.self) private var library
 
     var body: some View {
         @Bindable var export = library.export
-        let help = export.progress?.label ?? export.result?.title ?? ""
+        // What the export is doing, while it shows in place of the button's icon.
+        let activity = export.progress?.label ?? export.result?.title
+        // Counted only when idle: the body runs for each photo exported.
+        let count = activity == nil ? library.targetPhotos.count : 0
         Button {
-            export.isShowingActivity.toggle()
+            if activity != nil {
+                export.isShowingActivity.toggle()
+            } else {
+                library.exportPhotos()
+            }
         } label: {
             // A label with a symbol, so the toolbar keeps it in the group with the buttons next
             // to it. A drawn shape got a group of its own.
             Label {
-                Text(help)
+                Text(activity ?? "Export")
             } icon: {
-                icon
+                // Every state at the ring's width: the spinner and the warning are wider (19 pt
+                // to the ring's 18 at 15 pt) and widened the toolbar's glass group.
+                Image(systemName: "circle")
+                    .hidden()
+                    .overlay { icon }
             }
         }
-        .help(help)
+        .help(activity ?? (count > 1 ? "Export \(count) Photos (⇧⌘E)" : "Export Photo (⇧⌘E)"))
+        .disabled(activity == nil && count == 0)
         .popover(isPresented: $export.isShowingActivity, arrowEdge: .bottom) {
             ExportActivityView(model: export)
         }
@@ -35,13 +48,21 @@ struct ExportActivityButton: View {
                 Image(systemName: "progress.indicator")
                     .symbolEffect(.variableColor.iterative.dimInactiveLayers.nonReversing)
             } else {
-                Image(systemName: "progress.indicator", variableValue: progress.fraction)
+                // Variable Draw draws the circle's stroke clockwise from the top, over a dimmed
+                // track.
+                Image(systemName: "circle", variableValue: progress.fraction)
+                    .symbolVariableValueMode(.draw)
+                    .animation(.easeOut(duration: 0.3), value: progress.fraction)
             }
-        } else if export.result?.isClean == true {
-            Image(systemName: "checkmark.circle")
+        } else if let result = export.result {
+            if result.isClean {
+                Image(systemName: "checkmark.circle")
+            } else {
+                Image(systemName: "exclamationmark.triangle")
+                    .foregroundStyle(.yellow)
+            }
         } else {
-            Image(systemName: "exclamationmark.triangle")
-                .foregroundStyle(.yellow)
+            Image(systemName: "square.and.arrow.up")
         }
     }
 }

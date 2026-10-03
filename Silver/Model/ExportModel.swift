@@ -208,7 +208,7 @@ final class ExportModel {
         if summary.isClean {
             let id = summary.id
             Task {
-                try? await Task.sleep(for: .seconds(6))
+                try? await Task.sleep(for: .seconds(3))
                 if result?.id == id, !isShowingActivity { result = nil }
             }
         }

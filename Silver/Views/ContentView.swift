@@ -136,13 +136,7 @@ struct ContentView: View {
             .help("Show Original (\\): tap to switch, hold to peek")
             .disabled(library.activePhoto == nil || library.isCropping || library.viewMode != .loupe)
 
-            if library.export.isExporting || library.export.result != nil {
-                ExportActivityButton()
-            }
-
-            Button("Export", systemImage: "square.and.arrow.up") { library.exportPhotos() }
-                .help(library.targetPhotos.count > 1 ? "Export \(library.targetPhotos.count) Photos (⇧⌘E)" : "Export Photo (⇧⌘E)")
-                .disabled(library.targetPhotos.isEmpty)
+            ExportButton()
         }
 
         // The inspector toggle gets its own group, apart from the photo actions.
