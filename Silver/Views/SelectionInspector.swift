@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// The inspector while several photos are selected in the grid: what the export will contain
-/// and where it goes, before opening the export window.
+/// The inspector while several photos are selected in the grid: what the export will contain,
+/// before opening the export window.
 struct SelectionInspector: View {
     @Environment(LibraryModel.self) private var library
 
@@ -25,29 +25,16 @@ struct SelectionInspector: View {
     }
 }
 
-/// The export settings, a warning when names are taken in the export folder, and the button
-/// that opens the export window. The only part that reads the settings, so changing them in
-/// the export window doesn't update the rest.
+/// A warning when names are taken in the export folder, and the button that opens the export
+/// window. The only part that reads the export settings, so changing them in the export window
+/// doesn't update the rest.
 private struct ExportPlan: View {
     @Environment(LibraryModel.self) private var library
     let photos: [Photo]
 
     var body: some View {
         let export = library.export
-        InspectorSection("Export") {
-            VStack(spacing: 6) {
-                SummaryRow("Folder") {
-                    if let folder = export.outputFolder {
-                        Text(folder.lastPathComponent)
-                            .help(displayPath(of: folder))
-                    } else {
-                        Text("Not chosen").foregroundStyle(.secondary)
-                    }
-                }
-                SummaryRow("Format") { Text("JPEG · sRGB") }
-                SummaryRow("Quality") { Text("\(export.qualityPercent)").monospacedDigit() }
-                SummaryRow("Metadata") { Text(export.includeMetadata ? "Included" : "Removed") }
-            }
+        VStack(alignment: .leading, spacing: 10) {
             existingNote
             Button {
                 library.exportPhotos()
@@ -56,8 +43,7 @@ private struct ExportPlan: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            .help("Choose the folder and quality, then export (⇧⌘E)")
-            .padding(.top, 4)
+            .help("Choose where to export and the quality, then export (⇧⌘E)")
         }
         // The model lists the folder again after an export.
         .task(id: export.outputFolder) { await export.refreshExistingNames() }
@@ -67,7 +53,7 @@ private struct ExportPlan: View {
     private var existingNote: some View {
         let export = library.export
         let existing = export.existingCount(for: photos.map(\.url))
-        if existing > 0, let folder = export.outputFolder {
+        if existing > 0, export.exportsToFolder, let folder = export.outputFolder {
             let one = existing == 1
             let found = one ? "1 photo already has a JPEG" : "\(existing) photos already have JPEGs"
             let outcome = switch export.existingFilePolicy {
@@ -111,28 +97,6 @@ private struct SelectionHeader: View {
             return first.formatted(date: .abbreviated, time: .omitted)
         }
         return (first..<last).formatted(.interval.day().month(.abbreviated).year())
-    }
-}
-
-/// A label and its value in the export summary.
-private struct SummaryRow<Value: View>: View {
-    let title: String
-    @ViewBuilder let value: Value
-
-    init(_ title: String, @ViewBuilder value: () -> Value) {
-        self.title = title
-        self.value = value()
-    }
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(title).foregroundStyle(.secondary)
-            Spacer(minLength: 12)
-            value
-                .lineLimit(1)
-                .truncationMode(.middle)
-        }
-        .font(.callout)
     }
 }
 

@@ -13,6 +13,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Quitting stops an export, so it asks first.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let progress = library.export.progress else { return .terminateNow }
+        let alert = NSAlert()
+        alert.messageText = "Silver is exporting photos."
+        alert.informativeText = "\(progress.completed) of \(progress.total) are done. If you quit now, the rest aren’t exported."
+        alert.addButton(withTitle: "Keep Exporting")
+        alert.addButton(withTitle: "Quit")
+        return alert.runModal() == .alertFirstButtonReturn ? .terminateCancel : .terminateNow
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         library.flushSaves()
     }

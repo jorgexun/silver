@@ -1485,7 +1485,11 @@ final class LibraryModel {
     func exportPhotos(_ photos: [Photo]? = nil) {
         endCrop()
         flushSaves()
-        export.present(jobs: (photos ?? targetPhotos).map { ExportJob(source: $0.url, settings: $0.settings) })
+        let photos = photos ?? targetPhotos
+        export.present(
+            jobs: photos.map { ExportJob(source: $0.url, settings: $0.settings) },
+            thumbnails: photos.lazy.compactMap(\.thumbnail).prefix(3).map { $0 }
+        )
     }
 
     func revealActiveInFinder() {

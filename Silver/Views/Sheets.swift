@@ -1,131 +1,180 @@
 import SwiftUI
 
+/// Sets up an export. Starting it closes the sheet; the toolbar shows the progress.
 struct ExportSheet: View {
     @Bindable var model: ExportModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            switch model.phase {
-            case .configuring:
-                configuration
-            case .exporting(let completed, let total):
-                progress(completed: completed, total: total)
-            case .finished(let summary):
-                finished(summary)
+        VStack(spacing: 0) {
+            header
+                .padding(.horizontal, 20)
+                .padding(.top, 20)
+            Form {
+                Section("Destination") {
+                    folderRows
+                    photosRows
+                }
+                Section("Format") {
+                    LabeledContent("Quality") {
+                        HStack(spacing: 10) {
+                            TrackSlider(
+                                value: Binding(get: { model.quality }, set: { model.quality = ($0 * 100).rounded() / 100 }),
+                                range: 0.5...1,
+                                origin: 0.5
+                            )
+                            .frame(width: 160)
+                            Text("\(model.qualityPercent)")
+                                .monospacedDigit()
+                                .frame(width: 26, alignment: .trailing)
+                        }
+                    }
+                    Toggle(isOn: $model.includeMetadata) {
+                        Text("Include Metadata")
+                        Text("Camera, lens, capture date and location")
+                    }
+                    .accessibilityLabel("Include Metadata")
+                }
             }
+            .formStyle(.grouped)
+            .scrollDisabled(true)
+            .scrollContentBackground(.hidden)
+            footer
+                .padding(.horizontal, 20)
+                .padding(.bottom, 20)
         }
-        .padding(20)
-        .frame(width: 460)
-        .interactiveDismissDisabled(model.isExporting)
+        .frame(width: 480)
+        .fixedSize(horizontal: false, vertical: true)
+        .task(id: model.outputFolder) { await model.refreshExistingNames() }
     }
 
-    private var configuration: some View {
-        VStack(alignment: .leading, spacing: 18) {
+    private var header: some View {
+        HStack(spacing: 14) {
+            ThumbnailStack(images: model.thumbnails)
             VStack(alignment: .leading, spacing: 2) {
                 Text(model.jobs.count == 1 ? "Export 1 Photo" : "Export \(model.jobs.count) Photos")
-                    .font(.headline)
-                Text("sRGB JPEG files, named like the originals")
+                    .font(.title3.weight(.semibold))
+                Text(model.jobs.count == 1
+                     ? "Full-size sRGB JPEG · \(model.jobs.first.map { Exporter.fileName(for: $0.source) } ?? "")"
+                     : "Full-size sRGB JPEGs, named like the originals")
                     .font(.callout)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
+            Spacer(minLength: 0)
+        }
+    }
 
-            Form {
-                LabeledContent("Folder") {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Button {
-                            model.chooseOutputFolder()
-                        } label: {
-                            Label(model.outputFolder?.lastPathComponent ?? "Choose…", systemImage: "folder")
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                        }
-                        .help(model.outputFolder.map { "Export to \($0.path(percentEncoded: false)). Click to choose another folder." } ?? "Choose a folder for the exported files.")
-                        if let folder = model.outputFolder {
-                            Text(displayPath(of: folder.deletingLastPathComponent()))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.head)
-                        }
+    @ViewBuilder
+    private var folderRows: some View {
+        Toggle(isOn: $model.exportsToFolder) {
+            Text("Save to Folder")
+            Text("JPEG files you can share or archive")
+        }
+        .accessibilityLabel("Save to Folder")
+        if model.exportsToFolder {
+            LabeledContent {
+                Button(model.outputFolder == nil ? "Choose…" : "Change…") { model.chooseOutputFolder() }
+            } label: {
+                if let folder = model.outputFolder {
+                    Label {
+                        Text(folder.lastPathComponent)
+                        Text(displayPath(of: folder.deletingLastPathComponent()))
+                            .lineLimit(1)
+                            .truncationMode(.head)
+                    } icon: {
+                        Image(systemName: "folder")
                     }
+                    .help(displayPath(of: folder))
+                } else {
+                    Label("No folder chosen", systemImage: "folder.badge.questionmark")
+                        .foregroundStyle(.secondary)
                 }
-                LabeledContent("Quality") {
-                    HStack(spacing: 10) {
-                        TrackSlider(
-                            value: Binding(get: { model.quality }, set: { model.quality = ($0 * 100).rounded() / 100 }),
-                            range: 0.5...1,
-                            origin: 0.5
-                        )
-                        Text("\(model.qualityPercent)")
-                            .monospacedDigit()
-                            .frame(width: 26, alignment: .trailing)
-                    }
-                }
-                Picker("If File Exists", selection: $model.existingFilePolicy) {
+            }
+            let existing = model.existingCount(for: model.jobs.map(\.source))
+            if existing > 0, let folder = model.outputFolder {
+                Picker(selection: $model.existingFilePolicy) {
                     ForEach(ExistingFilePolicy.allCases) { Text($0.title).tag($0) }
+                } label: {
+                    Text("If a File Exists")
+                    let place = "“\(folder.lastPathComponent)”"
+                    Text(model.jobs.count == 1 ? "This photo is already in \(place)."
+                         : existing == model.jobs.count ? "All of these photos are already in \(place)."
+                         : "\(existing) of these photos \(existing == 1 ? "is" : "are") already in \(place).")
                 }
-                Toggle("Include metadata (EXIF, GPS)", isOn: $model.includeMetadata)
-            }
-            .formStyle(.columns)
-
-            HStack {
-                Spacer()
-                Button("Cancel") { model.dismiss() }
-                    .keyboardShortcut(.cancelAction)
-                Button("Export") { model.start() }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(model.outputFolder == nil)
             }
         }
     }
 
-    private func progress(completed: Int, total: Int) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Exporting…").font(.headline)
-            ProgressView(value: Double(completed), total: Double(max(total, 1))) {
-                Text("\(completed) of \(total)")
-                    .monospacedDigit()
+    @ViewBuilder
+    private var photosRows: some View {
+        Toggle(isOn: $model.addsToPhotos) {
+            Text("Add to Photos")
+            Text("Imported into your library, ready for iCloud")
+        }
+        .accessibilityLabel("Add to Photos")
+        if model.addsToPhotos && model.isPhotosAccessDenied {
+            LabeledContent {
+                Button("Open Settings") { PhotosImporter.openPrivacySettings() }
+            } label: {
+                Label {
+                    Text("Silver can’t add photos")
+                    Text("Allow it in Privacy & Security, under Photos.")
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
+                }
+            }
+        }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 8) {
+            if model.isRequestingAccess {
+                ProgressView().controlSize(.small)
+                Text("Waiting for access to Photos…")
+            } else if model.isExporting {
+                Text("Starts after the current export.")
+            }
+            Spacer()
+            Button("Cancel") { model.isPresented = false }
+                .keyboardShortcut(.cancelAction)
+            Button("Export") { model.start() }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!model.canStart)
+        }
+        .font(.callout)
+        .foregroundStyle(.secondary)
+    }
+}
+
+/// Up to three thumbnails, stacked: the first in front, the others smaller and darker behind it.
+private struct ThumbnailStack: View {
+    let images: [CGImage]
+
+    var body: some View {
+        ZStack {
+            if images.isEmpty {
+                Image(systemName: "photo.on.rectangle")
+                    .font(.system(size: 26))
                     .foregroundStyle(.secondary)
             }
-            HStack {
-                Spacer()
-                Button("Stop") { model.cancel() }
-                    .keyboardShortcut(.cancelAction)
+            // The first photo on top.
+            ForEach(Array(images.enumerated()).reversed(), id: \.offset) { index, image in
+                Image(decorative: image, scale: 1)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: 52, maxHeight: 52)
+                    .clipShape(RoundedRectangle(cornerRadius: 3))
+                    .overlay(RoundedRectangle(cornerRadius: 3).strokeBorder(.white.opacity(0.2), lineWidth: 0.5))
+                    .brightness(-0.2 * Double(index))
+                    .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
+                    .scaleEffect(1 - 0.12 * Double(index))
+                    .offset(y: -7 * Double(index))
             }
         }
-    }
-
-    private func finished(_ summary: ExportSummary) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Label {
-                Text(summary.wasCancelled ? "Export Stopped" : "Export Complete").font(.headline)
-            } icon: {
-                Image(systemName: summary.failures.isEmpty ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                    .foregroundStyle(summary.failures.isEmpty ? .green : .yellow)
-            }
-            Text("\(summary.exported.count) JPEG \(summary.exported.count == 1 ? "file" : "files") saved to \(summary.folder.lastPathComponent).")
-                .foregroundStyle(.secondary)
-
-            if !summary.failures.isEmpty {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(summary.failures) { failure in
-                            Text("\(failure.fileName): \(failure.message)")
-                                .font(.callout)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(maxHeight: 120)
-            }
-
-            HStack {
-                Button("Show in Finder") { model.revealInFinder() }
-                Spacer()
-                Button("Done") { model.dismiss() }
-                    .keyboardShortcut(.defaultAction)
-            }
-        }
+        .frame(width: 60, height: 60)
+        .offset(y: images.count > 1 ? 5 : 0)
     }
 }
 
